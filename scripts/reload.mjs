@@ -15,8 +15,14 @@
  *
  * Usage: `npm run reload` (after `npm run build`), optionally with
  * `DSH_PROFILE=<name>` when more than one profile mounts the plugin.
+ *
+ * The patch is REPLACED ATOMICALLY (write beside it, then rename) and read back
+ * before this script reports success. A patch file is read by the live watcher
+ * and by every future `dsh` start, so a write interrupted by a crash or a power
+ * loss used to leave a truncated YAML that made the harness refuse to boot — a
+ * rename cannot be observed half-done.
  */
-import { existsSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, renameSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -24,6 +30,41 @@ import { fileURLToPath } from 'node:url'
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const PACKAGE_NAME = 'dsh-stock-portfolio'
 const ROW_ID = 'stock-portfolio'
+
+/**
+ * Replace one file's contents without ever exposing a partial file.
+ *
+ * `writeFileSync` truncates and then writes: a reader — or the next boot — that
+ * arrives in between sees a half-written file. Writing a sibling and renaming
+ * over the target makes the swap atomic on POSIX, which matters here because the
+ * target is a file the harness parses before it can start.
+ * @param path - the file to replace.
+ * @param body - its new contents.
+ */
+function replaceAtomically(path, body) {
+  const staging = `${path}.staging-${String(process.pid)}`
+  writeFileSync(staging, body)
+  renameSync(staging, path)
+}
+
+/**
+ * Replace the patch, then read it back.
+ *
+ * The read-back is the guard that matters: this one file decides whether the
+ * harness starts at all, so the script confirms that what is now on disk still
+ * carries the row it just rewrote before it reports success.
+ * @param path - the patch file.
+ * @param body - the new contents.
+ * @param specifier - the module specifier that must appear on the row.
+ * @throws {Error} when the written file does not carry the row and its name.
+ */
+function writePatch(path, body, specifier) {
+  replaceAtomically(path, body)
+  const written = readFileSync(path, 'utf8')
+  if (!written.includes(`- id: ${ROW_ID}`) || !written.includes(`name: ${specifier}`)) {
+    throw new Error(`${path} did not read back with the ${ROW_ID} row; restore it from a backup before starting dsh`)
+  }
+}
 
 /**
  * Resolve the harness home, matching `dsh`'s own default.
@@ -54,13 +95,24 @@ function patchFiles(home) {
  * copy exists yet.
  * @returns the absolute bundle path.
  */
+/**
+ * The newest content-addressed Host bundle, or the canonical one when no dev
+ * copy exists yet.
+ * @returns the absolute bundle path.
+ * @throws {Error} when the chosen bundle is missing or empty — pointing the
+ *   profile at a module that is not there is what breaks the next `dsh` start.
+ */
 function newestBundle() {
   const lib = join(PACKAGE_ROOT, 'lib')
   const copies = readdirSync(lib)
     .filter(name => /^index\.dev\..+\.js$/u.test(name))
     .map(name => ({ name, at: statSync(join(lib, name)).mtimeMs }))
     .sort((left, right) => right.at - left.at)
-  return copies.length > 0 ? join(lib, copies[0].name) : join(lib, 'index.js')
+  const bundle = copies.length > 0 ? join(lib, copies[0].name) : join(lib, 'index.js')
+  if (!existsSync(bundle) || statSync(bundle).size === 0) {
+    throw new Error(`${bundle} is missing or empty; run \`npm run build\` first`)
+  }
+  return bundle
 }
 
 /**
@@ -97,7 +149,7 @@ if (files.length === 0) {
       process.exitCode = 1
       continue
     }
-    writeFileSync(file, next)
+    writePatch(file, next, specifier)
     // The watcher re-applies on an mtime change; a rebuild that produced the same
     // digest would otherwise leave the running process on the module it has.
     const now = new Date()

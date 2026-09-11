@@ -41,6 +41,28 @@ const HISTORY_BARS = 260
  */
 const MIN_HISTORY_BARS = 30
 
+/**
+ * Daily bars loaded for a symbol the log has just met.
+ *
+ * Deliberately a *recent* window rather than {@link HISTORY_BARS}: a full year of
+ * bars for a stock the user just typed is a request nobody asked for. 90 calendar
+ * days is roughly 60 trading days, which clears {@link MIN_HISTORY_BARS} — so the
+ * position is valued AND the equity curve draws from the first day, instead of
+ * staying blank until the next full refresh. That refresh still widens the series
+ * to {@link HISTORY_BARS} on its own schedule.
+ */
+const RECENT_BARS = 90
+
+/**
+ * How long a write waits for that window before answering without it.
+ *
+ * A latency budget, not a correctness one: the trade is committed before the
+ * fetch starts, and the provider's own timeout is 20 seconds. A panel that hangs
+ * that long behind a save button is worse than a price that appears a minute
+ * later, so the wait is capped and the fetch carries on in the background.
+ */
+const RECENT_BARS_WAIT_MS = 2_500
+
 /** How long the instrument index stays fresh before a rebuild is attempted. */
 const INSTRUMENT_INDEX_DAYS = 7
 
@@ -59,6 +81,14 @@ const INSTRUMENTS_SYNCED_KEY = 'instrumentsSyncedAt'
  * panel header. The database remembers instead.
  */
 const PRICES_REFRESHED_KEY = 'pricesRefreshedAt'
+
+/**
+ * The watermark for the last day each symbol was asked about.
+ *
+ * Stored as one JSON object under one key: it is a small map that is rewritten
+ * whole, and a meta row per holding would be a lot of rows to keep pruned.
+ */
+const PRICES_ATTEMPTED_KEY = 'pricesAttemptedOn'
 
 /** Where the current rates came from, and when they were written. */
 const FX_META = {
@@ -121,6 +151,25 @@ function localDay(iso: string): string {
   return `${String(at.getFullYear())}-${pad(at.getMonth() + 1)}-${pad(at.getDate())}`
 }
 
+/**
+ * The newest trading day the provider can have published, as `YYYY-MM-DD`.
+ *
+ * Daily bars are end-of-day, so day D's bar is served on D+1: on any given day
+ * the newest bar that can exist belongs to the previous weekday, and a series
+ * holding it has nothing left to collect. Exchange holidays are not in any
+ * calendar this plugin keeps — which is precisely why the attempt watermark
+ * exists, so a holiday is asked about once rather than on every open.
+ * @param now - the current instant.
+ * @returns the date, in the caller's own calendar.
+ */
+function latestExpectedDate(now: Date): string {
+  const at = new Date(now.getTime())
+  do {
+    at.setDate(at.getDate() - 1)
+  } while (at.getDay() === 0 || at.getDay() === 6)
+  return localDay(at.toISOString())
+}
+
 /** Resolved plugin configuration. */
 export interface PortfolioServiceOptions {
   /** Directory holding the database file. */
@@ -159,6 +208,13 @@ export class PortfolioService {
   private readonly dotenvCache = new Map<string, string | undefined>()
   /** The rate fetch currently in flight, shared by every caller asking for one. */
   private fxInFlight: Promise<FxAcquisition> | null = null
+  /**
+   * The price refresh currently in flight.
+   *
+   * The panel opening and the background scheduler can arrive together, and both
+   * would ask the provider for the same bars; the second caller rides this one.
+   */
+  private refreshInFlight: Promise<boolean> | null = null
   /** Set by {@link close}; every background continuation checks it first. */
   private closed = false
 
@@ -442,6 +498,11 @@ export class PortfolioService {
 
   /**
    * Add a trade, resolving its display name in the background.
+   *
+   * A symbol the log has never priced also gets its recent daily window loaded
+   * before this returns, so the panel has something to value on the very next
+   * read rather than after the next scheduled refresh. Both writers — the form
+   * and the chat tool — go through here, so both get it.
    * @param input - the user's trade fields.
    * @returns the inserted trade.
    * @throws {PortfolioError} when the trade would make the log inconsistent.
@@ -456,6 +517,7 @@ export class PortfolioService {
     const saved = this.db.insertTrade(named)
     // A symbol the index has never seen: go and ask, without blocking the write.
     if (named.name === null) void this.resolveNames([trade.symbol])
+    await this.loadRecentPrices([trade.symbol])
     return saved
   }
 
@@ -473,7 +535,12 @@ export class PortfolioService {
       throw new PortfolioError(`交易记录 #${String(id)} 不存在`, 404)
     }
     this.assertConsistent(existing.map(row => (row.id === id ? { ...row, ...trade } : row)))
-    return this.db.updateTrade(id, { ...trade, name: this.nameFor(trade.symbol) })
+    const saved = this.db.updateTrade(id, { ...trade, name: this.nameFor(trade.symbol) })
+    // An edit can point a trade at a symbol the portfolio has never held; the
+    // gap is the same one `addTrade` closes. Nothing waits on it here, because
+    // this method is synchronous and the row is already committed.
+    void this.loadRecentPrices([trade.symbol])
+    return saved
   }
 
   /**
@@ -628,41 +695,122 @@ export class PortfolioService {
   // ─── price refresh ─────────────────────────────────────────────────────────
 
   /**
-   * Fetch fresh daily bars for every symbol that has an open position.
+   * Bring the stored daily bars up to date, asking the provider only for what is
+   * actually missing.
    *
-   * Skipped entirely while the last successful refresh is inside the configured
-   * interval, because the underlying data changes at most once a day.
-   * @param force - refresh even when the interval has not elapsed.
-   * @returns whether a network refresh actually ran.
+   * ## Why this is not a timer
+   *
+   * Daily bars are end-of-day: day D's bar appears on D+1. A series whose newest
+   * bar is already the last trading day the provider can have published therefore
+   * has nothing to collect, and asking for it again is a request spent on an
+   * answer we already have. So this decides from the stored data, not from a
+   * clock: a symbol is refreshed when its newest bar is behind what could exist,
+   * and it is asked about at most once a day — the watermark that makes a market
+   * holiday cost one request instead of one per open.
+   *
+   * When something IS behind, only the gap is requested (`start_time` = the day
+   * after its newest stored bar), not the whole history, and one batch covers
+   * several symbols at the price of one request.
+   * @param force - re-read the full history for every open position, ignoring the
+   *   freshness rule. This is the panel's 刷新行情 button.
+   * @returns whether a network request actually ran.
    */
   async refresh(force = false): Promise<boolean> {
-    const settings = this.db.readSettings()
     const now = this.now()
+    // The panel opening and the scheduler ticking can land together, and both
+    // would ask for the same bars; the second caller rides the first one's work.
+    if (!force && this.refreshInFlight !== null) return false
     if (!force && this.lastFailureAt !== 0 && now.getTime() - this.lastFailureAt < FAILURE_BACKOFF_MS) {
       return false
     }
-    if (!force && this.refreshedAt !== null) {
-      const age = now.getTime() - Date.parse(this.refreshedAt)
-      if (Number.isFinite(age) && age < settings.refreshIntervalMinutes * 60_000) return false
-    }
 
-    const symbols = [...new Set(foldLedgers(this.db.listTrades())
+    const held = [...new Set(foldLedgers(this.db.listTrades())
       .filter(ledger => ledger.quantity > 0)
       .map(ledger => ledger.symbol))]
-    if (symbols.length === 0) return false
+    if (held.length === 0) return false
 
+    // One read, used both to decide and to measure the gaps: it has to describe
+    // the state BEFORE the fetch.
+    const newest = this.db.latestPriceDates()
+    const targets = force ? held : this.behind(held, newest, now)
+    if (targets.length === 0) return false
+
+    const run = this.fetchBars(targets, newest, force, now)
+    this.refreshInFlight = run
+    try {
+      return await run
+    } finally {
+      this.refreshInFlight = null
+    }
+  }
+
+  /**
+   * Which held symbols have bars older than the provider can possibly serve.
+   * @param held - symbols with an open position.
+   * @param newest - the newest stored bar date per symbol.
+   * @param now - the current instant.
+   * @returns the symbols worth a request.
+   */
+  private behind(held: readonly string[], newest: ReadonlyMap<string, string>, now: Date): string[] {
+    const expected = latestExpectedDate(now)
+    const today = localDay(now.toISOString())
+    const attempted = this.readAttempts()
+    return held.filter((symbol) => {
+      const have = newest.get(symbol)
+      // Never priced, or older than the newest bar that can exist.
+      if (have !== undefined && have >= expected) return false
+      // Already asked today and the provider had nothing newer: this is what a
+      // market holiday looks like, and it must not be re-asked on every open.
+      return attempted[symbol] !== today
+    })
+  }
+
+  /**
+   * Request and store bars for the given symbols.
+   *
+   * `since` is the earliest gap among them — one batch carries one bound, and a
+   * symbol with fresher data simply comes back with a little overlap, which the
+   * upsert absorbs. A symbol with no bars at all asks for the recent window
+   * instead, since it has no gap to speak of.
+   * @param targets - symbols to fetch.
+   * @param newest - the newest stored bar date per symbol, from before the fetch.
+   * @param force - read the full history rather than the gap.
+   * @param now - the current instant.
+   * @returns whether the request succeeded.
+   * @throws {TickFlowError} when the provider refuses; the caller records it.
+   */
+  private async fetchBars(
+    targets: readonly string[],
+    newest: ReadonlyMap<string, string>,
+    force: boolean,
+    now: Date,
+  ): Promise<boolean> {
+    const starts = targets.map((symbol) => {
+      const last = newest.get(symbol)
+      return last === undefined
+        ? now.getTime() - RECENT_BARS * 86_400_000
+        : Date.parse(`${last}T00:00:00Z`) + 86_400_000
+    })
     const client = this.client()
     try {
-      const bars = await client.dailyBars(symbols, HISTORY_BARS)
+      const bars = await client.dailyBars(
+        targets,
+        HISTORY_BARS,
+        force ? {} : { since: Math.min(...starts) },
+      )
       if (this.closed) return false
       for (const series of bars.values()) this.db.upsertPrices(series)
-      this.unresolved = symbols.filter(symbol => !bars.has(symbol))
+      // Only a symbol the provider has never answered for is "unresolved": a
+      // series that came back empty because its gap is a holiday is up to date,
+      // and calling it missing would put a false banner in the panel.
+      this.unresolved = targets.filter(symbol => !bars.has(symbol) && !newest.has(symbol))
       this.batchSupported = client.batchSupported
       this.refreshedAt = now.toISOString()
       this.db.writeMeta(PRICES_REFRESHED_KEY, this.refreshedAt)
+      this.rememberAttempt(targets, now)
       this.lastError = null
       this.lastFailureAt = 0
-      await this.resolveNames(symbols)
+      await this.resolveNames(targets)
       // First successful refresh is also the natural moment to build the name
       // index, so search works without a separate trigger.
       void this.syncInstruments(false)
@@ -675,14 +823,116 @@ export class PortfolioService {
   }
 
   /**
-   * How long until the next automatic refresh is due.
+   * The day each symbol was last asked about, so a holiday is asked about once.
+   * @returns the watermark map, symbol to `YYYY-MM-DD`.
+   */
+  private readAttempts(): Record<string, string> {
+    const raw = this.db.readMeta(PRICES_ATTEMPTED_KEY)
+    if (raw === null || raw === '') return {}
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+      const attempts: Record<string, string> = {}
+      for (const [symbol, day] of Object.entries(parsed as Record<string, unknown>)) {
+        if (typeof day === 'string') attempts[symbol] = day
+      }
+      return attempts
+    } catch {
+      // A corrupt watermark is the same as an absent one: ask again.
+      return {}
+    }
+  }
+
+  /**
+   * Record the attempt watermark for the symbols just fetched.
+   *
+   * Rewritten from the current holdings each time, so a symbol that left the
+   * portfolio does not leave an entry behind for ever.
+   * @param symbols - the symbols that were asked about.
+   * @param now - the current instant.
+   */
+  private rememberAttempt(symbols: readonly string[], now: Date): void {
+    const today = localDay(now.toISOString())
+    const attempts = this.readAttempts()
+    for (const symbol of symbols) attempts[symbol] = today
+    const held = new Set(foldLedgers(this.db.listTrades())
+      .filter(ledger => ledger.quantity > 0)
+      .map(ledger => ledger.symbol))
+    const kept: Record<string, string> = {}
+    for (const [symbol, day] of Object.entries(attempts)) {
+      if (held.has(symbol)) kept[symbol] = day
+    }
+    this.db.writeMeta(PRICES_ATTEMPTED_KEY, JSON.stringify(kept))
+  }
+
+  /**
+   * How long until the next automatic check is due.
    *
    * Read fresh on every tick so changing the interval takes effect without
-   * re-registering the timer.
+   * re-registering the timer. This is how often the background job LOOKS at the
+   * stored series; whether that look turns into a request is
+   * {@link refresh}'s decision, not this one's.
    * @returns the configured interval in milliseconds.
    */
   refreshIntervalMs(): number {
     return this.db.readSettings().refreshIntervalMinutes * 60_000
+  }
+
+  /**
+   * Load the recent daily window for symbols that have never been priced.
+   *
+   * The scheduled refresh only widens series it already knows how to value, and
+   * it runs on its own interval; a symbol that enters the log in between would
+   * show as unpriceable — no market value, no day move, no curve — until it came
+   * round again. This closes that gap at the moment the symbol arrives.
+   *
+   * A symbol that already has bars is skipped, so a second buy of a held stock
+   * costs no request.
+   * @param symbols - canonical symbols that should end up priced.
+   */
+  private async loadRecentPrices(symbols: readonly string[]): Promise<void> {
+    try {
+      if (this.closed) return
+      const unpriced = symbols.filter(symbol => (this.db.readCloses([symbol]).get(symbol) ?? []).length === 0)
+      if (unpriced.length === 0) return
+
+      const loading = (async () => {
+        const bars = await this.client().dailyBars(unpriced, RECENT_BARS)
+        if (this.closed) return
+        for (const series of bars.values()) this.db.upsertPrices(series)
+      })().catch((error: unknown) => {
+        // Reported where a failed refresh is reported: staying silent would leave
+        // the panel looking like the symbol simply has no price.
+        this.lastError = `加载 ${unpriced.join('、')} 最近 ${String(RECENT_BARS)} 天日线失败：`
+          + (error instanceof Error ? error.message : String(error))
+      })
+
+      await this.settleWithin(loading, RECENT_BARS_WAIT_MS)
+    } catch {
+      // The caller has already committed its trade by the time this runs, and a
+      // history fetch is an extra: it must never turn a successful write into a
+      // failed one.
+    }
+  }
+
+  /**
+   * Wait for one piece of work, but no longer than a budget.
+   *
+   * The work keeps running after the budget: this only decides how long the
+   * caller is held up, never whether the result is eventually stored.
+   * @param work - the work to wait for; it must already handle its own failure.
+   * @param ms - the budget in milliseconds.
+   */
+  private async settleWithin(work: Promise<void>, ms: number): Promise<void> {
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ms)
+      // Node must not be held open by a budget nobody is waiting on any more.
+      timer.unref?.()
+      void work.finally(() => {
+        clearTimeout(timer)
+        resolve()
+      })
+    })
   }
 
   /**

@@ -27,7 +27,7 @@ export function Overview({ state, equity, equityStatus }: {
   if (positions.length === 0) {
     return (
       <Empty title="还没有持仓">
-        在「交易记录」里添加第一笔买入，持仓、盈亏与统计会自动算出来。
+        在「交易」里添加第一笔买入，持仓、盈亏与统计会自动算出来。
       </Empty>
     )
   }

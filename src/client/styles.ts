@@ -116,7 +116,9 @@ export const STYLES = `
 .dsp-panel {
   position: relative;
   display: grid;
-  grid-template-columns: 188px minmax(0, 1fr);
+  /* Rail width: it carries five short labels and one footer stat, so every pixel
+     past that is taken straight out of the tables and the chart beside it. */
+  grid-template-columns: 152px minmax(0, 1fr);
   /* The single row is pinned to the panel's own height. With the default
      auto row, a tall section (Settings, a long trade log) grew the row past the
      panel, so .dsp-content was handed a box as tall as its content and the

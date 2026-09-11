@@ -11,6 +11,9 @@
  * set of quick-pick motives, the motives already in use, and a hint explaining
  * what it is for. The quick picks differ by direction because the two decisions
  * are not the same decision: nobody sells because the valuation is attractive.
+ * The list itself is shared with the chat tool (`src/motives.ts`) so a trade
+ * recorded by talking to the model carries the same vocabulary as one typed
+ * here, which is what keeps the by-motive breakdown meaningful.
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
@@ -19,22 +22,8 @@ import {
 import { Empty, SectionTitle } from '../shared.tsx'
 import { api } from '../api.ts'
 import { money, quantity, today, tone } from '../format.ts'
+import { MOTIVE_HISTORY_LIMIT, MOTIVE_PRESETS } from '../../motives.ts'
 import type { PortfolioState, SymbolMatch, Trade, TradeInput } from '../../types.ts'
-
-/**
- * The quick-pick motives, per direction.
- *
- * These are the reasons a retail holder actually writes down, kept short enough
- * to read at a glance. They are suggestions, never a closed set: the field stays
- * free text, and anything the user has used before joins the row below.
- */
-const MOTIVE_PRESETS: Readonly<Record<'buy' | 'sell', readonly string[]>> = {
-  buy: ['低估值买入', '财报超预期', '行业景气', '回调加仓', '定投', '突破买入', '分红再投', '长期看好'],
-  sell: ['止盈', '止损', '估值过高', '基本面恶化', '调仓换股', '到达目标价', '短期涨幅过大', '需要用钱'],
-}
-
-/** How many previously-used motives to offer alongside the presets. */
-const HISTORY_CHIPS = 6
 
 /** The editable shape of the form. */
 interface Draft {
@@ -215,8 +204,8 @@ export function Trades({ state, busy, onAdd, onUpdate, onDelete }: {
 
   return (
     <div>
-      <SectionTitle note={`共 ${String(state.trades.length)} 笔 · 记录动机可用于后续复盘分析`}>
-        交易记录
+      <SectionTitle>
+        交易
         <button
           type="button"
           className="dsp-btn"
@@ -240,7 +229,7 @@ export function Trades({ state, busy, onAdd, onUpdate, onDelete }: {
               ref={symbolInput}
               className="dsp-input"
               data-mono="true"
-              placeholder="600000.SH / 00700.HK / AAPL.US"
+              placeholder="600000.SH"
               value={draft.symbol}
               autoComplete="off"
               onChange={(event) => { patch({ symbol: event.target.value }) }}
@@ -333,7 +322,7 @@ export function Trades({ state, busy, onAdd, onUpdate, onDelete }: {
                     {motive}
                   </button>
                 ))}
-                {known.slice(0, HISTORY_CHIPS).map(motive => (
+                {known.slice(0, MOTIVE_HISTORY_LIMIT).map(motive => (
                   <button
                     type="button"
                     className="dsp-chip"
@@ -355,8 +344,7 @@ export function Trades({ state, busy, onAdd, onUpdate, onDelete }: {
               onChange={(event) => { patch({ motive: event.target.value }) }}
             />
             <span className="dsp-field-hint">
-              写清这笔交易的理由，之后「分析」页会按动机汇总已实现与浮动盈亏，检验哪种判断真正赚钱。
-              点上面的词即可填入，再点一次取消；虚线的是你之前写过的动机，输入框里也可以自由输入。
+              写清这笔交易的理由，会参与「分析」。点上面的词即可填入，再点一次取消；虚线的是你之前写过的动机，输入框里也可以自由输入。
             </span>
           </div>
 

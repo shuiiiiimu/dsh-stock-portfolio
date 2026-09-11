@@ -111,12 +111,19 @@ export class PortfolioStore {
   /** Open the dashboard, loading state on first use and starting the poll. */
   open(): void {
     this.set({ open: true })
-    if (this.snapshot.state === null) void this.load()
-    else void this.load({ quiet: true })
+    const loaded = this.snapshot.state === null ? this.load() : this.load({ quiet: true })
     // Every open asks the host for the latest rates. The host owns the freshness
     // guard, so a burst of opens costs one request, and a failed refresh leaves
     // the previous numbers in place with the reason recorded in the settings tab.
     void this.refreshRates(false)
+    // Behind the first paint, and behind the snapshot: switching 自动刷新 off has
+    // to silence this too, and on a first open the setting only arrives with the
+    // state this is waiting for. The host fetches only what is actually missing,
+    // so an open where nothing changed costs one local check and no request.
+    void loaded.then(() => {
+      if (this.snapshot.state?.settings.autoRefresh === true) return this.topUpPrices()
+      return undefined
+    })
     this.startPolling()
   }
 
@@ -249,7 +256,7 @@ export class PortfolioStore {
 
   /**
    * Refresh prices from the market-data provider.
-   * @param force - bypass the server's cache.
+   * @param force - re-read the full history instead of only what is missing.
    */
   async refresh(force = false): Promise<void> {
     try {
@@ -263,6 +270,28 @@ export class PortfolioStore {
       }
     } catch (error) {
       this.notify('error', messageOf(error))
+    }
+  }
+
+  /**
+   * Let the host top up whatever is actually behind, without interrupting anyone.
+   *
+   * Daily bars arrive the day after the close, so on most opens there is nothing
+   * to collect and the host answers out of its own database; only a series whose
+   * newest bar is behind the last published trading day costs a request, and then
+   * only for the days it is missing. That is what makes this safe to run on every
+   * open.
+   *
+   * Failures stay silent: the reason is already in the feed status the panel
+   * renders, and a background check is not something to interrupt a user with.
+   */
+  async topUpPrices(): Promise<void> {
+    try {
+      // A label of its own, so the header button only spins for a refresh the
+      // user actually asked for.
+      await this.mutate('refresh-auto', async () => ({ state: await api.refresh(false) }))
+    } catch {
+      // Deliberately swallowed; see above.
     }
   }
 

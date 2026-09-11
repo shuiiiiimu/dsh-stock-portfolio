@@ -282,9 +282,18 @@ export class TickFlowClient {
    * with one bad code still refresh the rest.
    * @param symbols - canonical symbols.
    * @param count - how many bars to request per symbol, newest last.
+   * @param options - `since` (ms epoch) drops every bar before that instant, which
+   *   is how an up-to-date series is topped up instead of re-read: the endpoint
+   *   treats it as a lower bound and `count` still selects the NEWEST bars of the
+   *   range, so a stale window shorter than `count` comes back whole.
    * @returns ascending bars keyed by symbol; symbols with no data are omitted.
    */
-  async dailyBars(symbols: readonly string[], count: number): Promise<Map<string, PriceBar[]>> {
+  async dailyBars(
+    symbols: readonly string[],
+    count: number,
+    options: { readonly since?: number | undefined } = {},
+  ): Promise<Map<string, PriceBar[]>> {
+    const since = options.since === undefined ? {} : { start_time: String(Math.floor(options.since)) }
     const result = new Map<string, PriceBar[]>()
     let first = true
     for (const batch of chunk(symbols, this.batchSize)) {
@@ -297,6 +306,7 @@ export class TickFlowClient {
             period: '1d',
             count: String(count),
             ...KLINE_QUERY,
+            ...since,
           })
           const data = (payload as { data?: unknown }).data
           if (data === null || typeof data !== 'object') continue
@@ -315,7 +325,9 @@ export class TickFlowClient {
       }
       for (const symbol of batch) {
         if (!this.keyed) await sleep(FREE_TIER_PACING_MS)
-        const payload = await this.json('/v1/klines', { symbol, period: '1d', count: String(count), ...KLINE_QUERY })
+        const payload = await this.json('/v1/klines', {
+          symbol, period: '1d', count: String(count), ...KLINE_QUERY, ...since,
+        })
         const data = (payload as { data?: unknown }).data
         if (data === null || typeof data !== 'object') continue
         const bars = barsOf(symbol, data as WireKlines)

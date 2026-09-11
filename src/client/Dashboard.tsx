@@ -35,7 +35,7 @@ interface TabDef {
 const TABS: readonly TabDef[] = [
   { id: 'overview', label: '概览', Icon: IconOverviewOutline16 },
   { id: 'holdings', label: '持仓', Icon: IconHoldingsOutline16 },
-  { id: 'trades', label: '交易记录', Icon: IconLedgerOutline16 },
+  { id: 'trades', label: '交易', Icon: IconLedgerOutline16 },
   { id: 'analysis', label: '分析', Icon: IconAnalysisOutline16 },
   { id: 'settings', label: '设置', Icon: IconSettingsOutline16 },
 ]
@@ -234,11 +234,7 @@ export function Dashboard({ store, usePortfolio }: {
                   <Overview state={state} equity={equity} equityStatus={equityStatus} />
                 )}
                 {tab === 'holdings' && (
-                  <Holdings
-                    state={state}
-                    busy={busy}
-                    onRefresh={(force) => { void store.refresh(force) }}
-                  />
+                  <Holdings state={state} />
                 )}
                 {tab === 'trades' && (
                   <Trades

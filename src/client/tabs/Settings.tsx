@@ -101,8 +101,7 @@ export function Settings({ settings, feed, busy, onSave, onRefresh, onRefreshRat
         <SectionTitle note="可选，行情数据源">TickFlow API Key</SectionTitle>
         {feed.apiKeySource === 'none' && (
           <Banner tone="info">
-            未配置 API Key，当前直接使用 TickFlow 的<strong>免费服务</strong>读取日线数据 —— 本插件只需要日线，
-            因此不填也能完整使用全部功能。填入 Key 只会切换到完整服务端点，获得更宽松的限流。
+            未配置 Key：使用 TickFlow <strong>免费服务</strong>，功能完整（本插件只用日线）；填入 Key 只是换成限流更宽松的端点。
           </Banner>
         )}
         {feed.lastError !== null && <Banner tone="error">{feed.lastError}</Banner>}
@@ -147,19 +146,16 @@ export function Settings({ settings, feed, busy, onSave, onRefresh, onRefreshRat
             )}
           </div>
           <span className="dsp-field-hint">
-            优先级：这里的设置 &gt; 环境变量 <code>TICKFLOW_API_KEY</code> &gt; 项目目录下的
-            <code>.env</code> &gt; 插件行 <code>config.apiKey</code>。
-            在这里填写的 Key 只保存在本机插件的 SQLite 数据库（文件权限 0600），不会回传到浏览器或日志；
-            在下方清除后即回落到后面的来源。
+            优先级：此处 &gt; <code>TICKFLOW_API_KEY</code> &gt; 项目 <code>.env</code> &gt; 插件行。
           </span>
         </div>
       </section>
 
       <section>
-        <SectionTitle note="按交易日保存，盘中不更新">行情刷新</SectionTitle>
+        <SectionTitle note="日线次日发布">行情刷新</SectionTitle>
 
         <div className="dsp-settings-row">
-          <span className="dsp-field-label">刷新间隔（分钟）</span>
+          <span className="dsp-field-label">后台检查间隔（分钟）</span>
           <div className="dsp-settings-inline">
             <input
               className="dsp-input"
@@ -187,8 +183,7 @@ export function Settings({ settings, feed, busy, onSave, onRefresh, onRefreshRat
             </button>
           </div>
           <span className="dsp-field-hint">
-            日线数据每个交易日只变一次，默认 360 分钟（6 小时）足以覆盖 A 股、港股、美股三个收盘时点。
-            最短 15 分钟；免费服务限流为 10 次/分钟，刷新按 5 个代码一批自动分批。
+            已有最新交易日的股票不会被请求，落后的只补缺口；后台自动检查（最短 15 分钟，默认 360），打开面板时也会检查。
           </span>
         </div>
 
@@ -205,6 +200,9 @@ export function Settings({ settings, feed, busy, onSave, onRefresh, onRefreshRat
               {settings.autoRefresh ? '已开启' : '已关闭'}
             </button>
           </div>
+          <span className="dsp-field-hint">
+            关闭后后台与打开面板都不再自动检查，只能点「立即刷新」。
+          </span>
         </div>
 
         <div style={{ marginTop: 14 }}>
@@ -245,7 +243,7 @@ export function Settings({ settings, feed, busy, onSave, onRefresh, onRefreshRat
             ))}
           </div>
           <span className="dsp-field-hint">
-            每个标的按自身市场的货币记账（A 股 CNY、港股 HKD、美股 USD）；跨市场汇总时按下面的汇率折算到基准货币。
+            各标的按自身市场货币记账（CNY / HKD / USD），汇总时按下面的汇率折算。
           </span>
         </div>
 
@@ -289,9 +287,7 @@ export function Settings({ settings, feed, busy, onSave, onRefresh, onRefreshRat
             </button>
           </div>
           <span className="dsp-field-hint">
-            汇率以天为周期：每天第一次打开面板时，通过 DSH 的 web 能力（web_fetch 优先，失败时退回
-            web_search）取一次最新汇率，当天不再重复请求；需要立刻更新就点「获取最新」。
-            上面两个输入框是手动覆盖，手动值会在下一次自动刷新时被替换。分币种小计始终按原币列示。
+            每天首次打开面板时自动取一次，当天不重复；手填的值会在下次自动刷新时被替换。
           </span>
           {settings.fx.error !== null && <Banner tone="error">{settings.fx.error}</Banner>}
           <div style={{ marginTop: 10 }}>
@@ -328,8 +324,7 @@ export function Settings({ settings, feed, busy, onSave, onRefresh, onRefreshRat
             </span>
           </div>
           <span className="dsp-field-hint">
-            插件把每个交易所的全部标的（代码 + 名称）缓存进本地 SQLite，因此添加交易时的代码搜索是
-            本地查询：立即返回、可离线、不消耗接口配额。索引每周自动更新一次。
+            全部标的（代码 + 名称）缓存在本地 SQLite，搜索即时、可离线、不消耗接口配额；每周自动更新。
             {' '}
             {settings.instrumentsSyncedAt === null
               ? ''

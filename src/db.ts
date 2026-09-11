@@ -693,6 +693,22 @@ export class PortfolioDatabase {
     return row?.date ?? null
   }
 
+  /**
+   * The newest stored bar date per symbol.
+   *
+   * How far behind a series is, is one number per symbol, and it is what decides
+   * whether a refresh needs to ask the provider at all. Only symbols that have
+   * ever been priced appear, so this reads the primary-key index and returns a
+   * row per holding rather than per instrument.
+   * @returns the newest date per symbol, for every symbol that has bars.
+   */
+  latestPriceDates(): Map<string, string> {
+    const rows = this.db.prepare('SELECT symbol, MAX(date) AS date FROM prices GROUP BY symbol').all() as unknown as {
+      symbol: string, date: string,
+    }[]
+    return new Map(rows.map(row => [row.symbol, row.date]))
+  }
+
   // ─── instruments ───────────────────────────────────────────────────────────
 
   /**

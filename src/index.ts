@@ -1,10 +1,11 @@
 /**
  * dsh-stock-portfolio — host half.
  *
- * Owns the SQLite store, the market-data client, and the JSON API the browser half
- * calls. The browser half ships from this same package (`dsh.client` +
- * `exports["./client"]`) and is discovered by the dsh-client-modules scan, so
- * this single Loader row brings up both faces.
+ * Owns the SQLite store, the market-data client, the JSON API the browser half
+ * calls, and the model-facing Tools the chat calls. The browser half ships from
+ * this same package (`dsh.client` + `exports["./client"]`) and is discovered by
+ * the dsh-client-modules scan, so this single Loader row brings up all three
+ * surfaces — panel, API and chat — over one store.
  *
  * Mounting:
  * ```yaml
@@ -19,6 +20,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 
 import { API_PREFIX, createRouter } from './http.ts'
 import { PortfolioService } from './service.ts'
+import { registerPortfolioTools } from './tool.ts'
 import type { RejectionCheck } from './http.ts'
 import type { WebCapability } from './fx.ts'
 import type { Context } from '@deepseek-ai/cordis'
@@ -131,6 +133,11 @@ export function apply(ctx: Context, rawConfig?: unknown): void {
   // Let other plugins (and dynamic Cordis packages) read the same store.
   ctx.provide('stockPortfolio', service)
 
+  // The chat side of the same store: a model-facing Tool that records a trade
+  // and asks the user for whatever the sentence left out. Registered on the
+  // root context, so every session sees it, and disposed with this plugin.
+  registerPortfolioTools(ctx, service)
+
   const route = {
     kind: 'prefix' as const,
     path: API_PREFIX,
@@ -154,14 +161,16 @@ export function apply(ctx: Context, rawConfig?: unknown): void {
   })
 
   ctx.effect(() => {
-    // The last time this scheduler actually asked for a refresh, so the
-    // configured interval is honored across ticks without re-registering.
-    let lastAttempt = Date.now()
+    // How often the scheduler LOOKS at the stored series. Whether that look
+    // becomes a request is the service's decision: a series already holding the
+    // newest bar the provider can have published is left alone, so this only has
+    // to be frequent enough to notice the day rolling over.
+    let lastLook = Date.now()
     const timer = setInterval(() => {
       if (!service.db.readSettings().autoRefresh) return
-      if (Date.now() - lastAttempt < service.refreshIntervalMs()) return
-      lastAttempt = Date.now()
-      void service.refresh(true).catch((error: unknown) => {
+      if (Date.now() - lastLook < service.refreshIntervalMs()) return
+      lastLook = Date.now()
+      void service.refresh(false).catch((error: unknown) => {
         console.warn('[stock-portfolio] scheduled price refresh failed:', error)
       })
       // Weekly, and only when the scheduler is already awake.
@@ -175,6 +184,14 @@ export function apply(ctx: Context, rawConfig?: unknown): void {
 
 export { PortfolioService } from './service.ts'
 export type { PortfolioServiceOptions } from './service.ts'
+export {
+  ADD_TRADE_TOOL, OVERVIEW_TOOL, createPortfolioTools, registerPortfolioTools,
+} from './tool.ts'
+export type {
+  PortfolioToolDeps, QuestionOption, ToolDefinition, ToolRegistry, ToolRunContext,
+  UserQuestion, UserQuestionAnswer, UserQuestionsCapability,
+} from './tool.ts'
+export { MOTIVE_HISTORY_LIMIT, MOTIVE_PRESETS } from './motives.ts'
 export {
   acquireRates, FX_ENDPOINTS, FX_SEARCH_QUERY, parseRatesFromSearch,
 } from './fx.ts'

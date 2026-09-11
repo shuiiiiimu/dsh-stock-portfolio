@@ -472,6 +472,91 @@ test('a key without the batch entitlement degrades to per-symbol requests', asyn
   }
 })
 
+test('a symbol the log has just met is priced on the spot, with the recent window', async () => {
+  // The panel reads its snapshot straight off the POST that created the trade, so
+  // a symbol the log has never held must be valued by the time that POST answers —
+  // not after the next scheduled refresh, which can be a whole interval away.
+  const dir = mkdtempSync(join(tmpdir(), 'dsp-recent-'))
+  const calls = []
+  const recording = async (input, init) => {
+    const url = new URL(String(input))
+    if (url.pathname.startsWith('/v1/klines')) calls.push(Object.fromEntries(url.searchParams))
+    return await stubFetch(input, init)
+  }
+  const local = new PortfolioService({
+    dataDir: dir, fetchImpl: recording, dotenvPath: join(dir, '.env'),
+  })
+  const server = createServer(createRouter(local, () => false))
+  await new Promise(resolve => { server.listen(0, '127.0.0.1', resolve) })
+  const origin = `http://127.0.0.1:${server.address().port}${API_PREFIX}`
+  const post = (path, payload) => fetch(`${origin}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  }).then(async response => await response.json())
+  try {
+    const { state } = await post('/trades', {
+      symbol: '00700.HK', side: 'buy', quantity: 100, price: 400, tradedAt: '2026-09-01',
+    })
+    const row = state.positions.find(item => item.symbol === '00700.HK')
+    assert.equal(row.price, 428.4, 'priced by the time the write answers')
+    assert.equal(row.priceDate, '2026-09-10')
+    assert.equal(row.marketValue, 42840)
+
+    // One recent window for one symbol — not the full year the scheduled refresh
+    // maintains, and not a request per symbol the portfolio already prices.
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].symbols, '00700.HK')
+    assert.equal(calls[0].count, '90')
+
+    calls.length = 0
+    const again = await post('/trades', {
+      symbol: '00700.HK', side: 'buy', quantity: 100, price: 410, tradedAt: '2026-09-02',
+    })
+    assert.deepEqual(calls, [], 'a second buy of a priced symbol asks for nothing')
+    assert.equal(again.state.positions.find(item => item.symbol === '00700.HK').quantity, 200)
+  } finally {
+    await new Promise(resolve => { server.close(resolve) })
+    local.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a refused history is reported, and the trade it was for is still committed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsp-recent-fail-'))
+  const refusing = async (input, init) => {
+    const url = new URL(String(input))
+    if (url.pathname.startsWith('/v1/klines')) {
+      return new Response(JSON.stringify({ code: 'BOOM', message: '行情服务不可用' }), {
+        status: 500, headers: { 'content-type': 'application/json' },
+      })
+    }
+    return await stubFetch(input, init)
+  }
+  const local = new PortfolioService({
+    dataDir: dir, fetchImpl: refusing, dotenvPath: join(dir, '.env'),
+  })
+  const server = createServer(createRouter(local, () => false))
+  await new Promise(resolve => { server.listen(0, '127.0.0.1', resolve) })
+  const origin = `http://127.0.0.1:${server.address().port}${API_PREFIX}`
+  try {
+    const response = await fetch(`${origin}/trades`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ symbol: '600000.SH', side: 'buy', quantity: 100, price: 9, tradedAt: '2026-09-01' }),
+    })
+    const { state } = await response.json()
+    assert.equal(response.status, 201, 'a provider fault is not an HTTP failure for the write')
+    assert.equal(state.trades.length, 1)
+    assert.equal(state.positions.find(item => item.symbol === '600000.SH').price, null)
+    assert.match(state.feed.lastError, /加载 600000\.SH 最近 90 天日线失败/)
+  } finally {
+    await new Promise(resolve => { server.close(resolve) })
+    local.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('the trust fence runs before any business logic', async () => {
   const guarded = createServer(createRouter(service, (_req, res) => {
     res.writeHead(401, { 'content-type': 'text/plain' })
