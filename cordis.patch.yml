@@ -1,0 +1,30 @@
+# dsh-stock-portfolio bundle layer.
+#
+# Applied when a profile lists `dsh-stock-portfolio` in `dsh.profile.bundles`
+# (or when a `--patch` overlay points at a checkout of this file).
+#
+# One row, two faces — the same dual-face shape the shipped `dsh.client`
+# packages use:
+#
+#   * Host half   — this row's resolved entry (`lib/index.js`): the SQLite
+#                   store, the market-data client, the portfolio service, and
+#                   the JSON routes under `/dsh-stock-portfolio/api`.
+#   * Browser half — `exports["./client"]` (`lib/client.js`), discovered by the
+#                   `dsh.client` declaration in this package's manifest. The
+#                   dsh-client-modules scan turns it into a `window.__DSH_BOOT__`
+#                   row; it is never named by a Loader row of its own.
+#
+# Optional config:
+#
+#   dataDir  — directory holding `portfolio.db`. Defaults to
+#              `$DSH_HOME/storages/stock-portfolio`.
+#   apiBase  — market-data endpoint override. Defaults to the keyed endpoint
+#              `https://api.tickflow.org`; the plugin falls back to the
+#              keyless `https://free-api.tickflow.org` on its own when no API
+#              key is configured.
+#   apiKey   — key for that endpoint; the dashboard setting, the environment,
+#              and a checkout `.env` all override it.
+
+- insert:
+    - id: stock-portfolio
+      name: 'dsh-stock-portfolio'

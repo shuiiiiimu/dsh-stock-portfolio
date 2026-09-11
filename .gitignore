@@ -1,0 +1,23 @@
+# Dependencies and build output. `lib/` is what a profile loads, and `npm run
+# build` regenerates it, so the npm package ships it while the repository does not
+# track it.
+node_modules/
+.npm-cache/
+lib/
+
+# Secrets: the market-data API key lives here. Never commit it.
+.env
+.env.*
+!.env.example
+
+# Local working notes — kept on disk only. `docs/demo1.png` is NOT listed here:
+# it is the preview image the README embeds, so it ships with the repository.
+docs/tickflow-api-research.md
+
+# Editors, tooling caches, and OS noise.
+*.tsbuildinfo
+coverage/
+.vscode/
+.idea/
+*.log
+.DS_Store
