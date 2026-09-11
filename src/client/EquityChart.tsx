@@ -7,7 +7,7 @@
  * would have to be inlined, and this needs about sixty lines.
  */
 import { useState } from 'react'
-import { money } from './format.ts'
+import { compact, money } from './format.ts'
 import type { Currency, EquityPoint } from '../types.ts'
 
 /** Plot geometry, in viewBox units. */
@@ -139,16 +139,4 @@ export function EquityChart({ points, currency }: {
       </div>
     </div>
   )
-}
-
-/**
- * Abbreviate a large money amount for an axis label.
- * @param value - the amount.
- * @returns e.g. `1.2万` or `3.4万`.
- */
-function compact(value: number): string {
-  const abs = Math.abs(value)
-  if (abs >= 100_000_000) return `${(value / 100_000_000).toFixed(1)}亿`
-  if (abs >= 10_000) return `${(value / 10_000).toFixed(1)}万`
-  return value.toFixed(0)
 }

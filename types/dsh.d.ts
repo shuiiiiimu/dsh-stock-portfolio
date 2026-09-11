@@ -119,6 +119,18 @@ declare module '@deepseek-ai/cordis' {
     get(name: string): unknown
     /** Publish a service other plugins can read. */
     provide(name: string, value: unknown): void
+    /**
+     * Listen to a harness Event. The subscription belongs to the calling fiber
+     * and is removed when it unloads, so no explicit disposer is kept.
+     */
+    /**
+     * Run `callback` once these services exist, on a fiber owned by the caller —
+     * the harness's own optional-registration path (`schedule` uses it for
+     * `sessionProjections`). Needed because a plugin row may be applied before
+     * the package that provides the service, and a one-time `get` would silently
+     * register nothing.
+     */
+    inject(deps: readonly string[], callback: (scope: Context) => void): () => void
     /** The DSH Web server route registry. */
     readonly webServer: {
       register(route: import('@deepseek-ai/dsh-host-webserver').WebRoute): () => void

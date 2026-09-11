@@ -334,6 +334,16 @@ export const STYLES = `
   color: var(--dsw-alias-label-tertiary);
 }
 
+/* The breakdown under a headline number — how many positions are up, how many
+   are down. Quieter than the ratio above it: it explains the number, it is not
+   another number to compare. */
+.dsp-card-note {
+  margin-top: 2px;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--dsw-alias-label-tertiary);
+}
+
 .dsp-section { margin-bottom: 20px; }
 
 .dsp-section-title {
@@ -392,6 +402,231 @@ export const STYLES = `
 
 .dsp-table tbody tr:last-child td { border-bottom: 0; }
 .dsp-table tbody tr:hover td { background: var(--dsw-alias-interactive-bg-hover); }
+
+/* ── expandable holdings rows ────────────────────────────────────────────── */
+
+/* A holding row is a disclosure: clicking anywhere on it opens the detail row
+   below, and the caret is the keyboard-reachable control for the same toggle. */
+.dsp-holding-row { cursor: pointer; }
+
+.dsp-holding-row[data-expanded='true'] td {
+  background: var(--dsw-alias-bg-layer-3, var(--dsw-alias-interactive-bg-active));
+}
+
+.dsp-row-lead { display: flex; align-items: center; gap: 6px; }
+
+.dsp-caret {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary);
+  cursor: pointer;
+  transition: transform var(--ds-transition-duration-fast, 120ms) var(--ds-ease-in-out, ease);
+}
+
+.dsp-caret:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
+.dsp-caret:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: -1px; }
+/* The shipped caret points down; a disclosure that is closed has to point at the
+   row it would open, so the resting state is the rotated one. */
+.dsp-caret { transform: rotate(-90deg); }
+.dsp-caret[data-open='true'] { transform: rotate(0deg); color: var(--dsw-alias-label-primary); }
+
+/* The detail row is a table row only because a table is what it belongs to: the
+   cell is a full-width canvas, so the nowrap and the right alignment the data
+   cells carry are reset here. */
+.dsp-detail-row td {
+  padding: 12px 14px 14px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+  text-align: left;
+  white-space: normal;
+  background: var(--dsw-alias-bg-base);
+}
+
+.dsp-detail-row:hover td { background: var(--dsw-alias-bg-base); }
+
+.dsp-detail {
+  display: grid;
+  grid-template-columns: minmax(0, 1.55fr) minmax(272px, 0.95fr);
+  gap: 6px 20px;
+  align-items: start;
+}
+
+.dsp-detail-chart { min-width: 0; }
+
+.dsp-detail-message {
+  display: block;
+  padding: 20px 4px;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* A trade the chart could not mark, because its own trading day has no bar yet
+   (daily bars are published after the close). Without this the marker would
+   simply not be there, and nothing would say why. */
+.dsp-detail-note {
+  margin-top: 6px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.dsp-detail-hint {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--dsw-alias-border-l1);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* ── conversation mentions (the Right-Sidebar pane) ──────────────────────── */
+
+/* The pane owns its scrolling: the Right Sidebar hands a tab body a definite
+   height and nothing else, so the strip stays put while the cards scroll. */
+.dsp-mention-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 10px 12px 16px;
+  font-family: var(--dsw-font-base-16-font-family, inherit);
+  color: var(--dsw-alias-label-primary);
+  /* The money colours live on the dashboard root; this pane is not inside that
+     element, so it declares the same two for itself. */
+  --dsp-up: var(--dsw-alias-state-error-primary);
+  --dsp-down: var(--dsw-alias-state-success-primary);
+  --dsp-flat: var(--dsw-alias-label-tertiary);
+}
+
+.dsp-mention-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 2px 10px;
+  font-size: 12px;
+}
+
+/* One card per mentioned symbol. It is the row detail plus a heading and the
+   holding's own numbers, so it borrows the table's surface and border rather
+   than inventing a second look for the same content. */
+.dsp-mention-card {
+  margin-bottom: 16px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-layer-2);
+  overflow: hidden;
+}
+
+.dsp-mention-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+  font-size: 13px;
+}
+
+.dsp-mention-head .dsp-symbol-name { font-size: 12px; }
+.dsp-mention-head .dsp-num-strong { font-variant-numeric: tabular-nums; }
+
+/* The holding numbers close the card, under a rule: the chart above them is the
+   subject, and the position it is being compared with reads as a footnote to it
+   rather than as the headline it was when this strip came first. */
+.dsp-mention-holdings {
+  margin-top: 2px;
+  padding: 10px 14px 12px;
+  border-top: 1px dashed var(--dsw-alias-border-l1);
+}
+
+.dsp-mention-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(116px, 1fr));
+  gap: 10px 14px;
+}
+
+.dsp-mention-stat { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.dsp-mention-stat-label { font-size: 11px; color: var(--dsw-alias-label-tertiary); }
+
+.dsp-mention-stat-value {
+  font-size: 14px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dsp-mention-stat-sub { font-size: 11px; color: var(--dsw-alias-label-tertiary); }
+
+/* Where the mention came from, quoted back: the pane moved on its own, so it
+   owes the user a sentence about why. */
+.dsp-mention-why {
+  margin: 8px 14px;
+  padding: 6px 9px;
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-multi-select, var(--dsw-alias-bg-layer-3));
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* The detail block already carries its own padding when it is a table cell;
+   inside a card it needs the frame's instead. */
+.dsp-mention-card > .dsp-detail { padding: 0 14px 4px; }
+.dsp-mention-card > .dsp-detail-message { padding: 20px 14px; }
+
+/* The column is narrow, so the detail block always stacks here: the chart on
+   top, the measured windows under it. The dashboard's two-column layout is a
+   viewport decision it cannot make — a wide window with a narrow right column
+   would still try to fit both halves side by side. */
+.dsp-mention-panel .dsp-detail { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.dsp-mention-panel .dsp-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 14px; }
+.dsp-mention-panel .dsp-chart-compact { height: 176px; }
+.dsp-mention-panel .dsp-detail-hint { display: none; }
+
+.dsp-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 16px; }
+.dsp-fact-col { display: flex; flex-direction: column; gap: 12px; }
+.dsp-fact-group { display: flex; flex-direction: column; gap: 3px; }
+
+.dsp-fact-head {
+  margin-bottom: 2px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.dsp-fact {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 3px;
+  border-bottom: 1px dashed var(--dsw-alias-border-l1);
+  font-size: 12.5px;
+}
+
+.dsp-fact-label { color: var(--dsw-alias-label-tertiary); white-space: nowrap; }
+.dsp-fact-value { font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+/* The panel is 94vw wide, so a narrow window has to give the chart the full row
+   rather than squeeze both halves. */
+@media (max-width: 900px) {
+  .dsp-detail { grid-template-columns: minmax(0, 1fr); }
+}
 
 /* A numeric cell that carries a second line — a date under a price, a ratio under
    an amount. Table cells are right-aligned, so both lines share that edge and the
@@ -552,8 +787,25 @@ export const STYLES = `
 .dsp-chart-grid { stroke: var(--dsw-alias-border-l1); stroke-width: 1; }
 .dsp-chart-cost { fill: none; stroke: var(--dsw-alias-label-tertiary); stroke-width: 1; stroke-dasharray: 4 3; }
 
+/* The row chart sits in a shorter band than the equity curve: it splits its
+   height between prices and volume, so it has to be a little taller in total
+   than a price-only chart of the same readability. */
+.dsp-chart-compact { height: 196px; }
+.dsp-chart-vol { opacity: 0.55; }
+.dsp-chart-vol[data-dir='up'] { fill: var(--dsp-up); }
+.dsp-chart-vol[data-dir='down'] { fill: var(--dsp-down); }
+
 .dsp-legend { display: flex; gap: 14px; font-size: 11.5px; color: var(--dsw-alias-label-tertiary); margin-top: 6px; }
 .dsp-legend-swatch { display: inline-block; width: 9px; height: 2px; margin-right: 5px; vertical-align: middle; border-radius: 2px; }
+.dsp-legend-dashed {
+  width: 14px;
+  height: 0;
+  background: none;
+  border-top: 1px dashed var(--dsw-alias-label-tertiary);
+}
+.dsp-legend-bar { display: inline-block; width: 5px; height: 10px; margin-right: 5px; vertical-align: -1px; border-radius: 1px; }
+.dsp-legend-bar[data-dir='up'] { background: var(--dsp-up); }
+.dsp-legend-bar[data-dir='down'] { background: var(--dsp-down); }
 
 /* ── states ──────────────────────────────────────────────────────────────── */
 

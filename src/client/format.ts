@@ -54,6 +54,35 @@ export function quantity(value: number | null | undefined): string {
 }
 
 /**
+ * Abbreviate a large number the way a Chinese quote panel does.
+ * @param value - the number, or `null`.
+ * @returns e.g. `1.2万`, `3.4亿`, or an em dash when nothing is known.
+ */
+export function compact(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—'
+  const abs = Math.abs(value)
+  if (abs >= 100_000_000) return `${(value / 100_000_000).toFixed(1)}亿`
+  if (abs >= 10_000) return `${(value / 10_000).toFixed(1)}万`
+  return value.toFixed(0)
+}
+
+/**
+ * Render a day count as a holding period.
+ * @param days - the day count, or `null`.
+ * @returns e.g. `12 天`, `1 年 3 个月`, or an em dash.
+ */
+export function holdingPeriod(days: number | null | undefined): string {
+  if (days === null || days === undefined || !Number.isFinite(days)) return '—'
+  const whole = Math.max(0, Math.round(days))
+  if (whole < 90) return `${String(whole)} 天`
+  const months = Math.round(whole / 30.44)
+  if (months < 24) return `${String(months)} 个月`
+  const years = Math.floor(months / 12)
+  const rest = months % 12
+  return rest === 0 ? `${String(years)} 年` : `${String(years)} 年 ${String(rest)} 个月`
+}
+
+/**
  * Format a ratio as a percentage.
  * @param value - the ratio (`0.0123` is `1.23%`), or `null`.
  * @param options - `signed` prefixes a `+` for positives.
@@ -63,24 +92,6 @@ export function percent(value: number | null | undefined, options: { signed?: bo
   if (value === null || value === undefined || !Number.isFinite(value)) return '—'
   const sign = value > 0 && options.signed === true ? '+' : ''
   return `${sign}${(value * 100).toFixed(2)}%`
-}
-
-/**
- * Format a money amount and a ratio together, the way a P&L cell reads.
- * @param amount - the money amount, or `null`.
- * @param ratio - the ratio, or `null`.
- * @param currency - the amount's currency.
- * @returns e.g. `+HK$1,234.00 (+2.31%)`, or `—` when nothing is known.
- */
-export function moneyWithPercent(
-  amount: number | null | undefined,
-  ratio: number | null | undefined,
-  currency: Currency,
-): string {
-  if (amount === null || amount === undefined || !Number.isFinite(amount)) return '—'
-  return ratio === null || ratio === undefined
-    ? money(amount, currency, { signed: true })
-    : `${money(amount, currency, { signed: true })} (${percent(ratio, { signed: true })})`
 }
 
 /**
@@ -133,14 +144,3 @@ export function today(now: Date = new Date()): string {
   return `${String(now.getFullYear())}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
 }
 
-/**
- * Shorten a symbol for a table cell, keeping the exchange suffix visible.
- * @param symbol - the canonical symbol.
- * @returns the code and suffix separately.
- */
-export function splitSymbol(symbol: string): { code: string, suffix: string } {
-  const dot = symbol.lastIndexOf('.')
-  return dot <= 0
-    ? { code: symbol, suffix: '' }
-    : { code: symbol.slice(0, dot), suffix: symbol.slice(dot + 1) }
-}

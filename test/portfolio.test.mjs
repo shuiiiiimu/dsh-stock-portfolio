@@ -183,6 +183,54 @@ test('statistics separate wins from losses', () => {
   assert.equal(stats.worstSymbol, 'TSLA.US')
 })
 
+test('the unrealized block separates winners from losers, and concentration from the weights', () => {
+  const { stats, positions } = derive([
+    // Two winners of different sizes and one loser, all in USD.
+    trade({ id: 1, symbol: 'AAPL.US', quantity: 150, price: 10, tradedAt: '2026-09-01' }),
+    trade({ id: 2, symbol: 'MSFT.US', quantity: 50, price: 20, tradedAt: '2026-08-01' }),
+    trade({ id: 3, symbol: 'TSLA.US', quantity: 20, price: 30, tradedAt: '2026-01-02' }),
+  ], [
+    quote({ symbol: 'AAPL.US', price: 12 }),
+    quote({ symbol: 'MSFT.US', price: 24 }),
+    quote({ symbol: 'TSLA.US', price: 21 }),
+  ])
+
+  // 1800 + 1200 + 420 = 3420 of market value.
+  assert.equal(stats.totalMarketValue, 3420)
+  assert.equal(stats.unrealizedWinners, 2)
+  assert.equal(stats.unrealizedLosers, 1)
+  assert.equal(stats.grossUnrealizedGain, 300 + 200)
+  assert.equal(stats.grossUnrealizedLoss, -180)
+
+  // The largest position is AAPL at 1800/3420, and the top three are everything.
+  assert.equal(stats.topSymbol, 'AAPL.US')
+  assert.ok(Math.abs(stats.topWeight - 1800 / 3420) < 1e-12)
+  assert.ok(Math.abs(stats.topThreeWeight - 1) < 1e-12)
+
+  // Holding time runs from the first buy in THIS symbol's log; NOW is 2026-09-11.
+  const bySymbol = new Map(positions.map(row => [row.symbol, row]))
+  assert.equal(bySymbol.get('AAPL.US').holdingDays, 10)
+  assert.equal(bySymbol.get('MSFT.US').holdingDays, 41)
+  assert.equal(bySymbol.get('TSLA.US').holdingDays, 252)
+  assert.equal(stats.longestHoldingDays, 252)
+  assert.ok(Math.abs(stats.avgHoldingDays - (10 + 41 + 252) / 3) < 1e-12)
+  assert.equal(stats.holdingSince, '2026-01-02')
+})
+
+test('a position with no quote is outside both the counts and the sums', () => {
+  const { stats } = derive([
+    trade({ id: 1, symbol: 'AAPL.US', quantity: 100, price: 10, tradedAt: '2026-01-02' }),
+    trade({ id: 2, symbol: 'TSLA.US', quantity: 10, price: 10, tradedAt: '2026-01-02' }),
+  ], [quote({ symbol: 'AAPL.US', price: 11 })])
+
+  // TSLA has no bar at all, so it cannot be called a winner or a loser.
+  assert.equal(stats.unrealizedWinners, 1)
+  assert.equal(stats.unrealizedLosers, 0)
+  assert.equal(stats.grossUnrealizedGain, 100)
+  assert.equal(stats.grossUnrealizedLoss, 0)
+  assert.equal(stats.topSymbol, 'AAPL.US')
+})
+
 test('converts three currencies through one pivot, and reports native subtotals', () => {
   const { stats } = derive([
     trade({ id: 1, symbol: 'AAPL.US', quantity: 10, price: 100, tradedAt: '2026-01-01' }),

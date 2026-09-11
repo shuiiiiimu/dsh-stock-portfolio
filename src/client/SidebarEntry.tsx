@@ -6,24 +6,25 @@
  *
  * ## The footer strip's layout
  *
- * `sidebar.footer.action` is declared a `list`, and the sidebar renders it as a
- * flex ROW (`packages/client/ui-sidebar/src/client/SidebarRoot.module.css`,
- * `.footerActions { display: flex }`). The existing occupant claims
- * `width: 100%`, so a second full-width row would not stack — it would overflow
- * beside it, pushing one of the two off the column.
+ * `sidebar.footer.action` is declared a `list`, and the sidebar renders its
+ * entries in a flex ROW (`packages/client/ui-sidebar/src/client/SidebarRoot.module.css`,
+ * `.footerActions { display: flex }`). Each occupant claims `width: 100%`, so two
+ * of them do not stack — they overflow side by side and one is pushed out of the
+ * column. (It is not hypothetical: the Cordis plugin row appearing beside this
+ * one is exactly how "股票持仓" disappeared from the foot.)
  *
  * The shipped JSX comment already states the intent ("Footer actions stack above
  * Settings in both sidebar widths"), so this component completes it: while
- * mounted, it puts its own parent into column flow, and restores the previous
- * value when the plugin unloads. The change is scoped to exactly one element the
- * plugin already lives inside, reverted on unmount, and never touches the
- * harness's own files.
+ * mounted, it puts the STRIP into column flow and restores the previous value on
+ * unmount. The strip is found by walking up to the flex row that holds the
+ * entries rather than by trusting `parentElement` — the seat may wrap each entry
+ * in its own element, and a `flex-direction` set on that wrapper stacks nothing.
  */
 import { useLayoutEffect, useRef } from 'react'
 import { Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import { IconPortfolioOutline16 } from './icons.tsx'
 import { money, percent, tone } from './format.ts'
-import type { PortfolioStore, PortfolioSnapshot } from './store.ts'
+import type { PortfolioStore } from './store.ts'
 import type { UsePortfolio } from './Dashboard.tsx'
 
 /**
@@ -40,13 +41,16 @@ export function SidebarEntry({ wide, store, usePortfolio }: {
   const open = usePortfolio(snapshot => snapshot.open)
   const state = usePortfolio(snapshot => snapshot.state)
 
+  // Re-applied on every render, not only on mount: the strip can be replaced, or
+  // have its inline style reset, while this entry stays mounted — and the failure
+  // mode is silent (the row is simply not there).
   useLayoutEffect(() => {
-    const parent = root.current?.parentElement
-    if (parent === null || parent === undefined) return
-    const previous = parent.style.flexDirection
-    parent.style.flexDirection = 'column'
-    return () => { parent.style.flexDirection = previous }
-  }, [])
+    const strip = flexRowAncestor(root.current)
+    if (strip === null) return
+    const previous = strip.style.flexDirection
+    strip.style.flexDirection = 'column'
+    return () => { strip.style.flexDirection = previous }
+  })
 
   const stats = state?.stats
   const settings = state?.settings
@@ -89,4 +93,23 @@ export function SidebarEntry({ wide, store, usePortfolio }: {
   )
 }
 
-export type { PortfolioSnapshot }
+/**
+ * The flex ROW that holds the footer entries.
+ *
+ * Walks up from this row's own element until it finds one laid out as a row: the
+ * seat is free to wrap every entry in a wrapper, so the immediate parent is not
+ * necessarily the strip that decides how entries flow.
+ * @param element - this entry's root element, or `null` before mount.
+ * @returns the element to switch to column flow, or `null` when there is none.
+ */
+function flexRowAncestor(element: HTMLElement | null): HTMLElement | null {
+  // A handful of levels is the whole sidebar foot; the bound keeps a layout
+  // surprise from turning into a walk up the entire frame.
+  let node = element?.parentElement ?? null
+  for (let level = 0; node !== null && level < 5; level += 1, node = node.parentElement) {
+    const style = getComputedStyle(node)
+    // The sidebar's own column is a flex box too — only a ROW is the strip.
+    if (style.display === 'flex' && style.flexDirection === 'row') return node
+  }
+  return null
+}

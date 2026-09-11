@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, test } from 'node:test'
 
-import { PortfolioDatabase, databasePath, displayPath } from '../lib/index.js'
+import { DEFAULT_SETTINGS, PortfolioDatabase, databasePath, displayPath } from '../lib/index.js'
 
 const dirs = []
 
@@ -288,8 +288,12 @@ test('the meta watermarks live beside settings without polluting them', () => {
     assert.equal(db.readMeta('instrumentsSyncedAt'), null)
     db.writeMeta('instrumentsSyncedAt', '2026-09-11T00:00:00.000Z')
     assert.equal(db.readMeta('instrumentsSyncedAt'), '2026-09-11T00:00:00.000Z')
-    // The settings reader never sees the `meta.` rows.
-    assert.equal(Object.keys(db.readSettings()).length, 6)
+    // The settings reader never sees the `meta.` rows. Counted against the
+    // shipped defaults, so adding a setting cannot silently make this vacuous.
+    assert.equal(
+      Object.keys(db.readSettings()).length,
+      Object.keys(DEFAULT_SETTINGS).length,
+    )
   } finally {
     db.close()
   }

@@ -61,6 +61,21 @@ export function IconAnalysisOutline16({ size = 16, className }: IconProps) {
   )
 }
 
+/** A speech bubble with a trend line inside: what the conversation mentioned. */
+export function IconMentionOutline16({ size = 16, className }: IconProps) {
+  return (
+    <svg width={size} height={size} className={className} viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path
+        d="M2.6 4.5a1.9 1.9 0 0 1 1.9-1.9h7a1.9 1.9 0 0 1 1.9 1.9v4.4a1.9 1.9 0 0 1-1.9 1.9H7.3l-2.7 2.3v-2.3H4.5a1.9 1.9 0 0 1-1.9-1.9z"
+        stroke="currentColor"
+        strokeWidth="1.25"
+        strokeLinejoin="round"
+      />
+      <path d="M5.2 8.6l1.6-1.7 1.3 1 1.7-2" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
 /** A dial with a needle: the overview. */
 export function IconOverviewOutline16({ size = 16, className }: IconProps) {
   return (

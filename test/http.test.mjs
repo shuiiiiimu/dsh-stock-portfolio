@@ -293,6 +293,44 @@ test('refresh stores daily bars for every held market', async () => {
   assert.equal(hk.currency, 'HKD')
 })
 
+test('one symbol\'s stored bars and indicators are served for the expanded row', async () => {
+  // A bare code is normalized the same way a trade is, so the panel can pass
+  // whatever the row shows.
+  const { status, body } = await call('/bars?symbol=600000')
+  assert.equal(status, 200)
+  assert.equal(body.symbol, '600000.SH')
+  assert.deepEqual(body.bars.map(bar => bar.date), ['2026-09-08', '2026-09-09', '2026-09-10'])
+  assert.deepEqual(body.bars.map(bar => bar.close), [9.4, 9.35, 9.26])
+  // The bars arrive ascending, which is the order the chart draws them in.
+  assert.ok(body.bars[0].date < body.bars[2].date)
+
+  // Three bars cannot answer a fifteen-bar window: the panel gets nothing for it
+  // rather than a number measured over three.
+  assert.equal(body.stats.barCount, 3)
+  assert.equal(body.stats.lastClose, 9.26)
+  assert.deepEqual(body.stats.returns.map(row => row.pct), [null, null, null, null, null])
+  assert.equal(body.stats.maxDrawdown60, null)
+  assert.equal(body.stats.volumeRatio, null)
+  assert.equal(body.stats.ma20, null)
+})
+
+test('a bars request names what it is missing instead of guessing', async () => {
+  const missing = await call('/bars')
+  assert.equal(missing.status, 400)
+  assert.match(missing.body.error, /symbol/)
+
+  const nonsense = await call('/bars?symbol=.')
+  assert.equal(nonsense.status, 400)
+
+  // A symbol nobody has fetched is an empty series, not an error: the row still
+  // has to render.
+  const unknown = await call('/bars?symbol=9988.HK')
+  assert.equal(unknown.status, 200)
+  assert.equal(unknown.body.symbol, '09988.HK')
+  assert.equal(unknown.body.stats.barCount, 0)
+  assert.equal(unknown.body.stats.lastClose, null)
+})
+
 test('a symbol the provider does not carry is reported, not silently dropped', async () => {
   const created = await call('/trades', {
     method: 'POST',
@@ -365,6 +403,51 @@ test('settings round-trip without ever echoing the key', async () => {
 
   const cleared = await call('/settings', { method: 'PUT', body: JSON.stringify({ apiKey: null }) })
   assert.equal(cleared.body.settings.apiKeyConfigured, false)
+})
+
+test('the mention feed answers per session, and refuses to guess which one', async () => {
+  // The feed itself is folded by the session projection (see mentions.test.mjs);
+  // what this endpoint owns is the routing: one session per request, and no
+  // answer at all when the caller does not say which conversation it means.
+  const feeds = {
+    'session-1': {
+      rev: 2,
+      batches: [{ rev: 2, source: 'assistant', at: 1_700_000_000_000, symbols: ['600000.SH'], excerpt: '…600000…' }],
+    },
+  }
+  service.useMentionSource(sessionId => feeds[sessionId] ?? { rev: 0, batches: [] })
+
+  const known = await call('/mentions?session=session-1')
+  assert.equal(known.status, 200)
+  assert.equal(known.body.rev, 2)
+  assert.deepEqual(known.body.batches[0].symbols, ['600000.SH'])
+
+  // A session that mentioned nothing is an empty feed, not an error, and a
+  // session nobody knows is the same thing.
+  const quiet = await call('/mentions?session=session-2')
+  assert.equal(quiet.status, 200)
+  assert.deepEqual(quiet.body, { rev: 0, batches: [] })
+
+  const missing = await call('/mentions')
+  assert.equal(missing.status, 400)
+  assert.match(missing.body.error, /session/)
+
+  service.useMentionSource(null)
+  assert.deepEqual((await call('/mentions?session=session-1')).body, { rev: 0, batches: [] })
+})
+
+test('the popup can be switched off without losing the feed', async () => {
+  const off = await call('/settings', { method: 'PUT', body: JSON.stringify({ mentionPopup: false }) })
+  assert.equal(off.status, 200)
+  assert.equal(off.body.settings.mentionPopup, false)
+  assert.equal(off.body.state.settings.mentionPopup, false)
+  // The feed still answers; only the browser's decision to reveal changes.
+  service.useMentionSource(() => ({ rev: 3, batches: [] }))
+  assert.equal((await call('/mentions?session=session-1')).body.rev, 3)
+  service.useMentionSource(null)
+
+  const on = await call('/settings', { method: 'PUT', body: JSON.stringify({ mentionPopup: true }) })
+  assert.equal(on.body.settings.mentionPopup, true)
 })
 
 test('nonsensical settings are refused rather than silently stored', async () => {

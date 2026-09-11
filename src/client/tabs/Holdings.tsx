@@ -6,12 +6,21 @@
  * The table is client-sorted: the whole position set is already in memory, so a
  * sort is a re-render rather than a round trip.
  *
+ * Every row is a disclosure. Collapsed (the default) the table is exactly the
+ * statement it was before; expanded it grows a second row holding that symbol's
+ * price/volume chart and its measured windows, loaded on first open from the
+ * local daily bars. Nothing is fetched until a row is actually opened, so a wide
+ * portfolio still costs one request to render.
+ *
  * There is no section heading: the panel header already names the section and
  * carries the counts, the feed date and the refresh button, so a title row here
  * only pushed the table down.
  */
-import { useState } from 'react'
+import { Fragment, useState } from 'react'
+import { IconChevronDownOutline14 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { SymbolDetail } from '../SymbolDetail.tsx'
 import { Empty } from '../shared.tsx'
+import { useSymbolBars } from '../useBars.ts'
 import { money, percent, quantity, tone } from '../format.ts'
 import { exchangeLabel } from '../../symbols.ts'
 import type { PortfolioState, Position } from '../../types.ts'
@@ -44,12 +53,16 @@ function valueOf(row: Position, key: SortKey): number | string {
 
 /**
  * Render the holdings section.
- * @param props - the loaded portfolio state and the refresh action.
+ * @param props - the loaded portfolio state.
  * @returns the section element.
  */
 export function Holdings({ state }: { state: PortfolioState }) {
   const [sort, setSort] = useState<SortKey>('weight')
   const [direction, setDirection] = useState<Direction>('desc')
+  const [expanded, setExpanded] = useState<readonly string[]>([])
+  // Only the open rows ask for a series, and each keeps its own until the feed
+  // publishes a newer trading day.
+  const details = useSymbolBars(expanded, state.feed.latestDate ?? '')
 
   if (state.positions.length === 0) {
     return <Empty title="暂无持仓">添加买入记录后，这里会按标的列出数量、成本、收盘价与盈亏。</Empty>
@@ -75,6 +88,16 @@ export function Holdings({ state }: { state: PortfolioState }) {
     }
     setSort(key)
     setDirection(NUMERIC.has(key) ? 'desc' : 'asc')
+  }
+
+  /**
+   * Open or close one row's detail.
+   * @param symbol - the row's symbol.
+   */
+  const toggleRow = (symbol: string): void => {
+    setExpanded(current => current.includes(symbol)
+      ? current.filter(item => item !== symbol)
+      : [...current, symbol])
   }
 
   /**
@@ -116,53 +139,91 @@ export function Holdings({ state }: { state: PortfolioState }) {
             </tr>
           </thead>
           <tbody>
-            {rows.map(row => (
-              <tr key={row.symbol}>
-                <td data-align="left">
-                  <div className="dsp-symbol">
-                    <span className="dsp-symbol-code">{row.symbol}</span>
-                    {row.name !== null && <span className="dsp-symbol-name">{row.name}</span>}
-                  </div>
-                </td>
-                <td data-align="left">
-                  <span className="dsp-market">{exchangeLabel(row.exchange)}</span>
-                </td>
-                <td>{quantity(row.quantity)}</td>
-                <td>{money(row.avgCost, row.currency)}</td>
-                <td>
-                  {row.price === null
-                    ? <span className="dsp-flat">无行情</span>
-                    : (
-                        <div className="dsp-cell-stack">
-                          <span>{money(row.price, row.currency)}</span>
-                          {row.priceDate !== null && <span className="dsp-cell-sub">{row.priceDate}</span>}
+            {rows.map((row) => {
+              const open = expanded.includes(row.symbol)
+              const detail = details[row.symbol]
+              return (
+                <Fragment key={row.symbol}>
+                  <tr
+                    className="dsp-holding-row"
+                    data-expanded={open}
+                    aria-expanded={open}
+                    onClick={() => { toggleRow(row.symbol) }}
+                  >
+                    <td data-align="left">
+                      <div className="dsp-row-lead">
+                        <button
+                          type="button"
+                          className="dsp-caret"
+                          data-open={open}
+                          aria-expanded={open}
+                          aria-label={`${open ? '收起' : '展开'} ${row.symbol} 的走势与指标`}
+                          onClick={(event) => { event.stopPropagation(); toggleRow(row.symbol) }}
+                        >
+                          <IconChevronDownOutline14 size={12} />
+                        </button>
+                        <div className="dsp-symbol">
+                          <span className="dsp-symbol-code">{row.symbol}</span>
+                          {row.name !== null && <span className="dsp-symbol-name">{row.name}</span>}
                         </div>
-                      )}
-                </td>
-                <td className={tone(row.dayPnl)}>
-                  {row.dayPnl === null
-                    ? <span className="dsp-flat">—</span>
-                    : (
-                        <div className="dsp-cell-stack">
-                          <span>{money(row.dayPnl, row.currency, { signed: true })}</span>
-                          <span className="dsp-cell-sub">{percent(row.dayPnlPct, { signed: true })}</span>
-                        </div>
-                      )}
-                </td>
-                <td className={`dsp-num-strong ${tone(row.unrealizedPnl)}`}>
-                  {row.unrealizedPnl === null
-                    ? <span className="dsp-flat">—</span>
-                    : (
-                        <div className="dsp-cell-stack">
-                          <span>{money(row.unrealizedPnl, row.currency, { signed: true })}</span>
-                          <span className="dsp-cell-sub">{percent(row.unrealizedPct, { signed: true })}</span>
-                        </div>
-                      )}
-                </td>
-                <td className={tone(row.realizedPnl)}>{money(row.realizedPnl, row.currency, { signed: true })}</td>
-                <td>{percent(row.weight)}</td>
-              </tr>
-            ))}
+                      </div>
+                    </td>
+                    <td data-align="left">
+                      <span className="dsp-market">{exchangeLabel(row.exchange)}</span>
+                    </td>
+                    <td>{quantity(row.quantity)}</td>
+                    <td>{money(row.avgCost, row.currency)}</td>
+                    <td>
+                      {row.price === null
+                        ? <span className="dsp-flat">无行情</span>
+                        : (
+                            <div className="dsp-cell-stack">
+                              <span>{money(row.price, row.currency)}</span>
+                              {row.priceDate !== null && <span className="dsp-cell-sub">{row.priceDate}</span>}
+                            </div>
+                          )}
+                    </td>
+                    <td className={tone(row.dayPnl)}>
+                      {row.dayPnl === null
+                        ? <span className="dsp-flat">—</span>
+                        : (
+                            <div className="dsp-cell-stack">
+                              <span>{money(row.dayPnl, row.currency, { signed: true })}</span>
+                              <span className="dsp-cell-sub">{percent(row.dayPnlPct, { signed: true })}</span>
+                            </div>
+                          )}
+                    </td>
+                    <td className={`dsp-num-strong ${tone(row.unrealizedPnl)}`}>
+                      {row.unrealizedPnl === null
+                        ? <span className="dsp-flat">—</span>
+                        : (
+                            <div className="dsp-cell-stack">
+                              <span>{money(row.unrealizedPnl, row.currency, { signed: true })}</span>
+                              <span className="dsp-cell-sub">{percent(row.unrealizedPct, { signed: true })}</span>
+                            </div>
+                          )}
+                    </td>
+                    <td className={tone(row.realizedPnl)}>{money(row.realizedPnl, row.currency, { signed: true })}</td>
+                    <td>{percent(row.weight)}</td>
+                  </tr>
+                  {open && (
+                    <tr className="dsp-detail-row">
+                      <td colSpan={9}>
+                        {detail === undefined
+                          ? <div className="dsp-detail dsp-detail-message">{`正在读取 ${row.symbol} 的日线…`}</div>
+                          : (
+                              <SymbolDetail
+                                subject={row}
+                                detail={detail}
+                                trades={state.trades.filter(trade => trade.symbol === row.symbol)}
+                              />
+                            )}
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              )
+            })}
           </tbody>
         </table>
       </div>
@@ -170,6 +231,7 @@ export function Holdings({ state }: { state: PortfolioState }) {
       <p className="dsp-field-hint" style={{ marginTop: 10 }}>
         本表按每个标的自己的币种显示，不做折算；组合层面的合计在「概览」里。
         收盘价为最新一个交易日的收盘价；成本价为摊薄成本（加权平均，不含手续费）；已实现盈亏是该标的历次卖出累计锁定的盈亏。
+        点任意一行展开：左侧是收盘价与成交量（虚线为成本价，三角形为你在这段时间里的买卖点），右侧是区间涨跌幅、波动率、量比与回撤等指标。
       </p>
     </div>
   )

@@ -55,6 +55,7 @@ interface SettingsPatch {
   usdCny?: number
   refreshIntervalMinutes?: number
   autoRefresh?: boolean
+  mentionPopup?: boolean
 }
 
 /**
@@ -202,6 +203,25 @@ export function Settings({ settings, feed, busy, onSave, onRefresh, onRefreshRat
           </div>
           <span className="dsp-field-hint">
             关闭后后台与打开面板都不再自动检查，只能点「立即刷新」。
+          </span>
+        </div>
+
+        <div className="dsp-settings-row">
+          <span className="dsp-field-label">会话提及时展开右侧栏</span>
+          <div className="dsp-settings-inline">
+            <button
+              type="button"
+              className="dsp-btn"
+              data-variant={settings.mentionPopup ? 'primary' : 'ghost'}
+              disabled={saving}
+              onClick={() => { void onSave({ mentionPopup: !settings.mentionPopup }) }}
+            >
+              {settings.mentionPopup ? '已开启' : '已关闭'}
+            </button>
+          </div>
+          <span className="dsp-field-hint">
+            开启后，只要对话里提到已记录标的的代码或名称，对话右侧栏就会自动展开「持仓提及」，展示这些标的的走势、指标与持仓统计。
+            关掉后提及仍会收集到那里，只是不会自动展开。
           </span>
         </div>
 

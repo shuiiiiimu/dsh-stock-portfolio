@@ -19,6 +19,8 @@ import { join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
 import { API_PREFIX, createRouter } from './http.ts'
+import { MENTION_PROJECTION_KEY, mentionFeedOf, mentionProjectionUnit } from './mentions.ts'
+import type { MentionState, SessionEventLike, SessionHeaderLike } from './mentions.ts'
 import { PortfolioService } from './service.ts'
 import { registerPortfolioTools } from './tool.ts'
 import type { RejectionCheck } from './http.ts'
@@ -27,6 +29,29 @@ import type { Context } from '@deepseek-ai/cordis'
 
 /** Cordis function-plugin name. */
 export const name = 'stock-portfolio'
+
+/**
+ * The two harness faces the mention projection needs, declared structurally.
+ *
+ * Both are read with `ctx.get` rather than injected: a deployment without a
+ * projection registry still gets the dashboard, its chat Tools, and its prices —
+ * only the conversation pane goes without a feed.
+ */
+interface SessionProjectionsFace {
+  register(definition: {
+    key: string
+    stateSchema: { parse(value: unknown): unknown }
+    init(header: SessionHeaderLike): unknown
+    apply(state: MentionState, event: SessionEventLike): unknown
+    stateVersion: number
+  }): () => void
+  stateOf(session: unknown, key: string): unknown
+}
+
+/** The live session store, as this plugin reads it. */
+interface SessionsFace {
+  get(id: string): unknown
+}
 
 /**
  * `webServer` is a hard requirement: without it there is no way for the dashboard
@@ -94,17 +119,21 @@ function resolveConfig(raw: unknown): Required<Pick<Config, 'dataDir'>> & Omit<C
  * mounts the Connection carrier we ask it for the same verdict the `/api` prefix
  * would get. Without that carrier the route is only reachable on the bound
  * interface, which is the deployment's own choice.
+ *
+ * The carrier is resolved per request rather than once, because "not mounted
+ * yet" and "never mounted" are indistinguishable at apply time: sampling it once
+ * would turn a row that happens to be applied first into an unfenced route for
+ * the life of the process.
  * @param ctx - the plugin context.
  * @returns the check the router calls before any business logic.
  */
 function trustFence(ctx: Context): RejectionCheck {
-  const connection = ctx.get('connection') as
-    | { requestRejection?: (request: unknown) => number | undefined }
-    | undefined
-  if (connection?.requestRejection === undefined) return () => false
-  const check = connection.requestRejection.bind(connection)
   return (req: IncomingMessage, res: ServerResponse): boolean => {
-    const rejection = check(req)
+    const connection = ctx.get('connection') as
+      | { requestRejection?: (request: unknown) => number | undefined }
+      | undefined
+    if (connection?.requestRejection === undefined) return false
+    const rejection = connection.requestRejection(req)
     if (rejection === undefined) return false
     res.writeHead(rejection, { 'content-type': 'text/plain; charset=utf-8' })
     res.end(rejection === 401 ? 'unauthorized' : 'forbidden')
@@ -137,6 +166,44 @@ export function apply(ctx: Context, rawConfig?: unknown): void {
   // and asks the user for whatever the sentence left out. Registered on the
   // root context, so every session sees it, and disposed with this plugin.
   registerPortfolioTools(ctx, service)
+
+  // The conversation feed behind the 「提及」 pane, as a session projection.
+  //
+  // A projection rather than a `session/event` listener, because the pane has to
+  // answer for a conversation that was restored from disk, and reading a
+  // restored log directly is deprecated for new code: the framework folds this
+  // unit over the log itself — history included — and hands the result back
+  // synchronously. It also means the state is checkpointed with every other
+  // projection, so a resumed session does not re-scan from scratch.
+  //
+  // The registry is AWAITED, not sampled: a plugin row may be applied before the
+  // package that provides `sessionProjections`, and a one-time `ctx.get` that
+  // happens to be early registers nothing at all — silently, leaving every feed
+  // empty forever. `ctx.inject` runs the callback when the service appears,
+  // which is the same path `schedule` uses for this very service.
+  ctx.inject(['sessionProjections'], (scope) => {
+    const projections = scope.get('sessionProjections') as SessionProjectionsFace | undefined
+    if (projections === undefined) return
+    // One unit for every session: the framework gives each its own cell, folds
+    // it — history included, for a session restored from disk — and checkpoints
+    // it beside the other projections.
+    scope.effect(
+      () => projections.register(mentionProjectionUnit(() => service.mentionMatcher())),
+      'stock-portfolio: mention projection',
+    )
+  })
+
+  // Both faces are resolved per request for the same reason: the route can be
+  // called long before this row's neighbours are up, and a captured `undefined`
+  // would answer an empty feed for the lifetime of the process.
+  service.useMentionSource((sessionId: string) => {
+    const projections = ctx.get('sessionProjections') as SessionProjectionsFace | undefined
+    const sessions = ctx.get('sessions') as SessionsFace | undefined
+    const session = sessions?.get(sessionId)
+    if (projections === undefined || session === undefined) return { rev: 0, batches: [] }
+    const state = projections.stateOf(session, MENTION_PROJECTION_KEY)
+    return mentionFeedOf(state === undefined ? undefined : (state as MentionState))
+  })
 
   const route = {
     kind: 'prefix' as const,
@@ -208,3 +275,11 @@ export {
   buildEquityCurve, convert, derivePortfolio, foldLedgers, rateTable, sortTrades,
 } from './portfolio.ts'
 export type { Rates } from './portfolio.ts'
+export { computeSymbolStats, RETURN_WINDOWS } from './indicators.ts'
+export {
+  createMentionMatcher, excerptFor, foldMentionState, initMentionState, MENTION_PROJECTION_KEY, MENTION_STATE_VERSION,
+  mentionFeedOf, mentionProjectionUnit, parseMentionState, projectMessage, textOfContent,
+} from './mentions.ts'
+export type {
+  MentionMatch, MentionMessage, MentionState, MentionTarget, SessionEventLike, SessionHeaderLike, SessionLike,
+} from './mentions.ts'

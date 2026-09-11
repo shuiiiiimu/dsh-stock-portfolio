@@ -5,7 +5,7 @@
  */
 import { EquityChart } from '../EquityChart.tsx'
 import { Banner, BreakdownBars, Empty, PnlCard, SectionTitle, StatCard } from '../shared.tsx'
-import { money, percent, quantity, tone } from '../format.ts'
+import { money, percent, holdingPeriod, quantity, tone } from '../format.ts'
 import type { EquityPoint, PortfolioState } from '../../types.ts'
 
 /** How many positions the contribution table shows before it is a full table. */
@@ -58,10 +58,12 @@ export function Overview({ state, equity, equityStatus }: {
           hint="浮动盈亏 + 已实现盈亏，收益率按累计投入成本计算"
         />
         <PnlCard
-          label="浮动盈亏"
+          label="未实现盈亏"
           amount={stats.totalUnrealizedPnl}
           ratio={stats.totalUnrealizedPct}
           currency={currency}
+          note={`${String(stats.unrealizedWinners)} 个浮盈 · ${String(stats.unrealizedLosers)} 个浮亏`}
+          hint={`也就是浮动盈亏：持仓市值 − 持仓成本，不含已经卖掉落袋的部分。浮盈合计 ${money(stats.grossUnrealizedGain, currency)}，浮亏合计 ${money(stats.grossUnrealizedLoss, currency)}`}
         />
         <PnlCard label="当日盈亏" amount={stats.dayPnl} ratio={stats.dayPnlPct} currency={currency} />
         <PnlCard
@@ -77,6 +79,22 @@ export function Overview({ state, equity, equityStatus }: {
           sub={stats.closedPositions === 0
             ? '暂无清仓记录'
             : `${String(stats.closedPositions)} 次清仓 · 盈亏比 ${stats.profitFactor === null ? '—' : stats.profitFactor.toFixed(2)}`}
+        />
+        <StatCard
+          label="持仓集中度"
+          value={percent(stats.topWeight)}
+          sub={stats.topSymbol === null
+            ? '暂无报价'
+            : `最大 ${stats.topSymbol} · 前三大 ${percent(stats.topThreeWeight)}`}
+          hint="最大单一持仓占组合市值的比例，前三大是持仓最大的三个标的合计。占比越高，单只标的的波动对组合的影响越大"
+        />
+        <StatCard
+          label="平均持有天数"
+          value={stats.avgHoldingDays === null ? '—' : holdingPeriod(stats.avgHoldingDays)}
+          sub={stats.holdingSince === null
+            ? '暂无持仓'
+            : `最早 ${stats.holdingSince} · 最长 ${holdingPeriod(stats.longestHoldingDays)}`}
+          hint="每个标的从首笔买入算到今天，含已经减仓但没清仓的部分"
         />
       </div>
 

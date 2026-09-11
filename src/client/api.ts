@@ -7,11 +7,19 @@
  * whole transport is `fetch`, which is why the dashboard bundle stays small.
  */
 import type {
-  Currency, EquityPoint, FxRefreshResult, PortfolioSettings, PortfolioState, SymbolMatch, Trade, TradeInput,
+  Currency, EquityPoint, FxRefreshResult, MentionFeed, PortfolioSettings, PortfolioState, SymbolBar, SymbolMatch,
+  SymbolStats, Trade, TradeInput,
 } from '../types.ts'
 
 /** Must match the host half's `API_PREFIX`. */
 export const API_PREFIX = '/dsh-stock-portfolio/api'
+
+/** What `GET /bars` answers: one symbol's series and the indicators over it. */
+export interface SymbolBars {
+  readonly symbol: string
+  readonly bars: readonly SymbolBar[]
+  readonly stats: SymbolStats
+}
 
 /** An error whose message came from the host and is safe to display. */
 export class ApiError extends Error {
@@ -136,6 +144,24 @@ export const api = {
    */
   equity: (days: number): Promise<{ points: EquityPoint[] }> =>
     request(`/equity?days=${String(days)}`),
+
+  /**
+   * Load one symbol's trailing daily bars and their indicators, for the row a
+   * user just expanded.
+   * @param symbol - the canonical symbol.
+   * @param limit - how many trailing bars to draw.
+   * @returns the canonical symbol, its bars, and the indicator block.
+   */
+  bars: (symbol: string, limit = 160): Promise<SymbolBars> =>
+    request(`/bars?symbol=${encodeURIComponent(symbol)}&limit=${String(limit)}`),
+
+  /**
+   * Read one session's conversation mention feed.
+   * @param sessionId - the session on screen.
+   * @returns that session's newest revision plus its recent batches.
+   */
+  mentions: (sessionId: string): Promise<MentionFeed> =>
+    request<MentionFeed>(`/mentions?session=${encodeURIComponent(sessionId)}`),
 
   /**
    * Search the instrument index for a symbol or name.

@@ -192,25 +192,26 @@ export function currencyOfSymbol(symbol: string): Currency {
 }
 
 /**
+ * The exchange-local code inside a symbol, suffix removed.
+ *
+ * The inverse of the suffix half of {@link normalizeSymbol}: `600519.SH` gives
+ * `600519`, and a symbol with no suffix is returned unchanged rather than
+ * throwing, because this is also used to read a user's own spelling.
+ * @param symbol - the symbol, canonical or bare.
+ * @returns the code without its exchange suffix.
+ */
+export function codeOfSymbol(symbol: string): string {
+  const dot = symbol.lastIndexOf('.')
+  return dot <= 0 ? symbol : symbol.slice(0, dot)
+}
+
+/**
  * The display label for an exchange.
  * @param exchange - the exchange code.
  * @returns a Chinese label, falling back to the raw code for an unknown market.
  */
 export function exchangeLabel(exchange: Exchange): string {
   return EXCHANGE_LABEL[exchange] ?? exchange
-}
-
-/**
- * Whether a string is already in canonical form.
- * @param symbol - candidate symbol.
- * @returns true when {@link normalizeSymbol} would return it unchanged.
- */
-export function isCanonicalSymbol(symbol: string): boolean {
-  try {
-    return normalizeSymbol(symbol).symbol === symbol
-  } catch {
-    return false
-  }
 }
 
 /**
@@ -224,8 +225,5 @@ export function instrumentType(value: unknown): InstrumentType | null {
     ? (value as InstrumentType)
     : null
 }
-
-/** Every exchange currency the plugin knows, in reporting order. */
-export const KNOWN_CURRENCIES: readonly Currency[] = ['CNY', 'HKD', 'USD']
 
 export { EXCHANGE_CURRENCY }

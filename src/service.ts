@@ -21,14 +21,17 @@ import { PortfolioDatabase, databasePath, displayPath } from './db.ts'
 import type { StoredSettings } from './db.ts'
 import { acquireRates } from './fx.ts'
 import type { FxAcquisition, FxRateSource, WebCapability } from './fx.ts'
+import { computeSymbolStats } from './indicators.ts'
+import { createMentionMatcher } from './mentions.ts'
+import type { MentionMatch, MentionTarget } from './mentions.ts'
 import { buildEquityCurve, derivePortfolio, foldLedgers, rateTable, sortTrades } from './portfolio.ts'
 import type { Rates } from './portfolio.ts'
-import { currencyOfSymbol, exchangeOfSymbol, normalizeSymbol } from './symbols.ts'
+import { codeOfSymbol, currencyOfSymbol, exchangeOfSymbol, normalizeSymbol } from './symbols.ts'
 import { TickFlowClient, TickFlowError } from './tickflow.ts'
 import { PortfolioError } from './types.ts'
 import type {
-  ApiKeySource, Currency, EquityPoint, FxRefreshResult, FxStatus, Instrument, PortfolioSettings, PortfolioState,
-  QuoteFeedStatus, SymbolMatch, Trade, TradeInput,
+  ApiKeySource, Currency, EquityPoint, FxRefreshResult, FxStatus, Instrument, MentionFeed, PortfolioSettings,
+  PortfolioState, QuoteFeedStatus, SymbolBar, SymbolMatch, SymbolStats, Trade, TradeInput,
 } from './types.ts'
 
 /** Daily bars requested per symbol: roughly a trading year. */
@@ -217,6 +220,10 @@ export class PortfolioService {
   private refreshInFlight: Promise<boolean> | null = null
   /** Set by {@link close}; every background continuation checks it first. */
   private closed = false
+  /** The matcher for the current portfolio, rebuilt when the portfolio changes. */
+  private matcherCache: { signature: string, match: (text: string) => MentionMatch[] } | null = null
+  /** Where `/mentions` reads from; wired by the host plugin's projection. */
+  private mentionSource: ((sessionId: string) => MentionFeed) | null = null
 
   constructor(options: PortfolioServiceOptions) {
     this.options = options
@@ -380,6 +387,7 @@ export class PortfolioService {
       fx: this.fxStatus(),
       refreshIntervalMinutes: settings.refreshIntervalMinutes,
       autoRefresh: settings.autoRefresh,
+      mentionPopup: settings.mentionPopup,
       dbPath: displayPath(databasePath(this.options.dataDir)),
       instrumentCount: this.db.instrumentCount(),
       instrumentsSyncedAt: this.db.readMeta(INSTRUMENTS_SYNCED_KEY),
@@ -400,6 +408,23 @@ export class PortfolioService {
       latestDate: this.db.latestPriceDate(),
       batchSupported: this.batchSupported,
     }
+  }
+
+  /**
+   * One symbol's trailing daily bars and the indicators measured from them.
+   *
+   * The stored series is the only source: expanding a row is a local read, so it
+   * costs no provider quota and works offline. A symbol whose history is shorter
+   * than a window answers with `null` for that window rather than with a number
+   * measured over fewer bars.
+   * @param symbol - the symbol to read, in any accepted spelling.
+   * @param limit - how many trailing bars to return.
+   * @returns the canonical symbol, its bars, and the indicator block.
+   */
+  symbolBars(symbol: string, limit: number): { symbol: string, bars: SymbolBar[], stats: SymbolStats } {
+    const parsed = normalizeSymbol(symbol)
+    const bars = this.db.readBars(parsed.symbol, limit)
+    return { symbol: parsed.symbol, bars, stats: computeSymbolStats(bars) }
   }
 
   /**
@@ -581,6 +606,7 @@ export class PortfolioService {
     usdCny?: number | undefined
     refreshIntervalMinutes?: number | undefined
     autoRefresh?: boolean | undefined
+    mentionPopup?: boolean | undefined
   }): PortfolioSettings {
     let typedRate = false
     if (patch.apiKey !== undefined) {
@@ -619,7 +645,75 @@ export class PortfolioService {
       this.db.writeSetting('baseCurrency', patch.baseCurrency)
     }
     if (patch.autoRefresh !== undefined) this.db.writeSetting('autoRefresh', patch.autoRefresh)
+    if (patch.mentionPopup !== undefined) this.db.writeSetting('mentionPopup', patch.mentionPopup)
     return this.publicSettings(this.db.readSettings())
+  }
+
+  // ─── conversation mentions ─────────────────────────────────────────────────
+
+  /**
+   * Every symbol the portfolio knows, as the mention matcher wants them.
+   *
+   * The whole trade log, not just the open positions: a message about a stock
+   * that was sold last month is still a message about this portfolio, and the
+   * pane can show its chart and its realized result even without a position.
+   * @returns the targets, symbol-sorted.
+   */
+  mentionTargets(): MentionTarget[] {
+    const trades = this.db.listTrades()
+    const symbols = [...new Set(trades.map(trade => trade.symbol))].sort()
+    const names = this.db.namesOf(symbols)
+    const fromTrades = new Map<string, string | null>()
+    for (const trade of trades) if (!fromTrades.has(trade.symbol)) fromTrades.set(trade.symbol, trade.name)
+    return symbols.map((symbol) => {
+      const code = codeOfSymbol(symbol)
+      return {
+        symbol,
+        code,
+        // The instrument index is the better source; the trade's own copy is the
+        // fallback for a symbol the index has never listed.
+        name: names.get(symbol) ?? fromTrades.get(symbol) ?? null,
+      }
+    })
+  }
+
+  /**
+   * The matcher for the portfolio as it stands.
+   *
+   * Rebuilt only when the target set changes, because the session projection
+   * calls this once per committed event: building three regexes per symbol for
+   * every message of every session would be work nobody asked for, and the
+   * portfolio changes on a human timescale.
+   * @returns a function that scans one message for portfolio symbols.
+   */
+  mentionMatcher(): (text: string) => MentionMatch[] {
+    const targets = this.mentionTargets()
+    const signature = targets.map(target => `${target.symbol}\u0000${target.name ?? ''}`).join('\u0001')
+    if (this.matcherCache?.signature !== signature) {
+      this.matcherCache = { signature, match: createMentionMatcher(targets) }
+    }
+    return this.matcherCache.match
+  }
+
+  /**
+   * Install the reader the `/mentions` route answers from.
+   *
+   * The feed belongs to the session projection, which only the host plugin can
+   * register (it needs the harness's projection registry); the service keeps the
+   * routing so the browser has one endpoint to poll and one place to be wrong.
+   * @param source - the per-session reader, or `null` to answer with an empty feed.
+   */
+  useMentionSource(source: ((sessionId: string) => MentionFeed) | null): void {
+    this.mentionSource = source
+  }
+
+  /**
+   * One session's mention feed.
+   * @param sessionId - the session the browser is showing.
+   * @returns the feed; empty when nothing has been registered or folded yet.
+   */
+  sessionMentions(sessionId: string): MentionFeed {
+    return this.mentionSource?.(sessionId) ?? { rev: 0, batches: [] }
   }
 
   // ─── exchange rates ────────────────────────────────────────────────────────

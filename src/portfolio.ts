@@ -335,7 +335,7 @@ export function derivePortfolio(input: DeriveInput): DerivedPortfolio {
   const positions = valued
     .filter(({ ledger }) => ledger.quantity > FLAT_EPSILON)
     .map(({ ledger, quote }) => buildPosition(ledger, quote, {
-      baseCurrency, rates, totalMarketValue,
+      baseCurrency, rates, totalMarketValue, now: input.now,
     }))
     .sort((left, right) => (right.marketValue ?? 0) - (left.marketValue ?? 0))
 
@@ -347,6 +347,7 @@ export function derivePortfolio(input: DeriveInput): DerivedPortfolio {
     baseCurrency,
     rates,
     tradeCount: input.trades.length,
+    now: input.now,
   })
   return { positions, closed, stats }
 }
@@ -361,7 +362,7 @@ export function derivePortfolio(input: DeriveInput): DerivedPortfolio {
 function buildPosition(
   ledger: SymbolLedger,
   quote: Quote | null,
-  context: { baseCurrency: Currency, rates: Rates, totalMarketValue: number },
+  context: { baseCurrency: Currency, rates: Rates, totalMarketValue: number, now: Date },
 ): Position {
   const { baseCurrency, rates } = context
   const avgCost = ledger.quantity > FLAT_EPSILON ? ledger.cost / ledger.quantity : 0
@@ -400,6 +401,7 @@ function buildPosition(
     tradeCount: ledger.tradeCount,
     firstTradeAt: ledger.firstTradeAt,
     lastTradeAt: ledger.lastTradeAt,
+    holdingDays: daysSince(ledger.firstTradeAt, context.now),
     weight,
   }
 }
@@ -416,6 +418,7 @@ function buildStats(input: {
   baseCurrency: Currency
   rates: Rates
   tradeCount: number
+  now: Date
 }): PortfolioStats {
   const { positions, closed, valued, baseCurrency, rates } = input
   const toBase = (amount: number, currency: Currency): number => convert(amount, currency, baseCurrency, rates)
@@ -456,6 +459,25 @@ function buildStats(input: {
   const committed = totalCost + sum(closed.map(row => toBase(row.costSold, row.currency)))
   const priorValue = totalMarketValue - dayPnl
 
+  // Winners and losers, counted and summed in the base currency: the count says
+  // how broad the result is, the two sums say how lopsided it is.
+  const unrealized = positions
+    .filter(row => row.unrealizedPnl !== null)
+    .map(row => toBase(row.unrealizedPnl ?? 0, row.currency))
+  const winners = unrealized.filter(value => value > 0)
+  const losers = unrealized.filter(value => value < 0)
+
+  // Weights are already converted shares of the portfolio, so concentration is
+  // just the sorted head of them.
+  const weights = positions.map(row => row.weight).sort((left, right) => right - left)
+  const largest = [...positions].sort((left, right) => right.weight - left.weight)[0]
+
+  // Holding time runs from the first buy to today, so a position trimmed last
+  // week still counts from the day it was opened.
+  const holdingDays = positions
+    .map(row => row.holdingDays)
+    .filter((value): value is number => value !== null)
+
   return {
     baseCurrency,
     totalMarketValue,
@@ -470,6 +492,16 @@ function buildStats(input: {
     openPositions: positions.length,
     closedPositions: closed.length,
     tradeCount: input.tradeCount,
+    unrealizedWinners: winners.length,
+    unrealizedLosers: losers.length,
+    grossUnrealizedGain: sum(winners),
+    grossUnrealizedLoss: sum(losers),
+    topWeight: weights[0] ?? 0,
+    topSymbol: largest === undefined || largest.marketValue === null ? null : largest.symbol,
+    topThreeWeight: sum(weights.slice(0, 3)),
+    avgHoldingDays: holdingDays.length === 0 ? null : sum(holdingDays) / holdingDays.length,
+    longestHoldingDays: holdingDays.length === 0 ? null : Math.max(...holdingDays),
+    holdingSince: positions.map(row => row.firstTradeAt).sort()[0] ?? null,
     winRate: closed.length === 0 ? null : wins.length / closed.length,
     avgWin: wins.length === 0 ? null : grossProfit / wins.length,
     avgLoss: losses.length === 0 ? null : -grossLoss / losses.length,
@@ -481,6 +513,18 @@ function buildStats(input: {
     native: nativeTotals(positions, closed),
     rates,
   }
+}
+
+/**
+ * Whole days between a `YYYY-MM-DD` date and a reference instant.
+ * @param date - the earlier date, as the trade log stores it.
+ * @param now - the reference instant.
+ * @returns the day count, never negative, or `null` when the date is unparseable.
+ */
+function daysSince(date: string, now: Date): number | null {
+  const parsed = Date.parse(`${date}T00:00:00Z`)
+  if (Number.isNaN(parsed)) return null
+  return Math.max(0, Math.floor((now.getTime() - parsed) / 86_400_000))
 }
 
 /**

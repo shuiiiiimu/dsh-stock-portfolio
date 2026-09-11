@@ -1,7 +1,7 @@
 /**
  * dsh-stock-portfolio — browser half.
  *
- * Contributes two cells and owns one store:
+ * Contributes three cells and owns one store:
  *
  *   `sidebar.footer.action` — the trigger row, rendered by the sidebar ABOVE
  *                             its Settings seat. A fresh list id and an `order`
@@ -10,18 +10,29 @@
  *                             displaces the other.
  *   `shell.overlay`         — the dashboard itself, in the frame-wide floating
  *                             layer. Rendered only while open.
+ *   `sidebar.right.pane.tab` — the 「持仓提及」 pane in the conversation's right
+ *                             Sidebar: what the current conversation mentioned,
+ *                             one card per holding. Registered as a Right-Sidebar
+ *                             tab type, which is a two-stage registration this
+ *                             file performs inside the slot injection — see
+ *                             {@link MentionsPanel}.
  *
- * Both cells read the same {@link PortfolioStore} through the registration's
+ * All three read the same {@link PortfolioStore} through the registration's
  * `hooks` face, which the renderer turns into a `usePortfolio(selector)` prop.
  * The store is created here, in the plugin's own closure, and released by
- * `ctx.effect` when the plugin unloads.
+ * `ctx.effect` when the plugin unloads. The conversation watcher that feeds the
+ * mention pane runs for as long as the plugin is mounted, whether or not any of
+ * these cells is on screen.
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
 
 import { Dashboard } from './Dashboard.tsx'
+import { SessionWatcher } from './SessionWatcher.tsx'
 import { SidebarEntry } from './SidebarEntry.tsx'
+import { MENTIONS_ID, MENTIONS_KIND, MentionsPanel, mentionsDefinition } from './MentionsPanel.tsx'
+import type { SidebarRightFace, SidebarRightTabsFace } from './MentionsPanel.tsx'
 import { createPortfolioStore } from './store.ts'
 import { STYLE_TAG_ID, STYLES } from './styles.ts'
 
@@ -39,13 +50,69 @@ const SIDEBAR_ORDER = 10
 /** The overlay's order; nothing else occupies the layer, so any value works. */
 const OVERLAY_ORDER = 100
 
+/** The frame's panel actions, as this half needs them; absent in a bare frame. */
+interface LayoutFace {
+  openRightbar?: (track: boolean, fullscreen: boolean) => void
+}
+
 /**
  * Mount the sidebar entry, the dashboard, and their shared store.
  * @param ctx - the browser plugin context.
  */
 export function apply(ctx: Context): void {
-  const store = createPortfolioStore()
+  /**
+   * Reveal the mention pane.
+   *
+   * Both Right-Sidebar faces are looked up per call rather than captured at
+   * apply time — the package that provides them may apply after this one, and a
+   * deployment whose frame has no right column simply has neither. `openTab` is
+   * the navigation call that both opens the tab and expands the column, and it
+   * is idempotent for a kind already open, and it throws when no session surface
+   * is mounted yet — which a fresh page load can hit, because the watcher's
+   * first poll and the column's seat race each other. That is reported as "not
+   * delivered" rather than swallowed, so the store tries again.
+   * @returns whether the pane is now on screen (or already was).
+   */
+  const reveal = (): boolean => {
+    const rightbar = ctx.get('sidebarRight') as SidebarRightFace | undefined
+    if (rightbar === undefined) {
+      // The service is absent, which on a fresh load means "not up yet" far more
+      // often than "this frame has no right column". The frame's own expand action
+      // is tried, and the reveal stays owed so the next tick can open the tab for
+      // real once the service appears.
+      const layout = ctx.get('layout') as LayoutFace | undefined
+      layout?.openRightbar?.(true, false)
+      return false
+    }
+    // A pane that is painting needs nothing: it updates itself from the feed.
+    // What counts as "already showing" is measured by the pane, not taken from
+    // the column's layout state — see `PortfolioStore.paneVisible`.
+    // A pane that is painting needs nothing: it updates itself from the feed.
+    if (store.paneVisible) return true
+    try {
+      rightbar.openTab(MENTIONS_KIND)
+      return true
+    } catch (error) {
+      // Reported rather than swallowed: a reveal that quietly never happens is
+      // the whole bug this path exists to prevent, and the store retries on its
+      // next tick.
+      //
+      // Deliberately NOT nudging `layout.openRightbar` here. The seat reports the
+      // column's state to the frame itself (`syncPresentation`), so asking the
+      // frame directly reserves a wide column that the seat — still believing it
+      // is collapsed — fills with nothing. That is a blank right half of the
+      // window, which is exactly what it looked like the one time it was tried.
+      console.warn('[stock-portfolio] mention reveal failed, retrying:', error)
+      return false
+    }
+  }
+
+  const store = createPortfolioStore({ onMention: reveal })
   ctx.effect(() => () => { store.dispose() }, 'stock-portfolio: dispose store')
+
+  // The sidebar row is the one surface that is always visible, so its number is
+  // loaded at startup rather than waiting for the panel to be opened.
+  store.startSnapshotWatch()
 
   // A plugin bundle cannot ship a side stylesheet: the factory closure is the
   // only place allowed to touch the document, so the sheet is injected here and
@@ -74,9 +141,51 @@ export function apply(ctx: Context): void {
     order: OVERLAY_ORDER,
     inject: face,
   }, Dashboard))
+
+  // Following the conversation is not tied to anything being open — the whole
+  // point is that opening a session is enough — but a slot is the only place a
+  // plugin is handed the session on screen. This seat is the conversation
+  // header's own utility row: a registration that renders nothing, exists for
+  // every session, and tells the store which conversation to follow.
+  ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({
+    name: 'conversation.session.header.utilities',
+    id: 'stock-portfolio',
+    order: SIDEBAR_ORDER,
+    inject: () => ({ store }),
+  }, SessionWatcher))
+
+  // Stage one of the tab type: what a 「持仓提及」 tab IS. Registered against the
+  // Right Sidebar's own registry the moment that service exists.
+  //
+  // AWAITED, not sampled. The registry belongs to another package, and a plugin
+  // row may be applied before the one that provides it — or before publishing it
+  // has settled. Sampling once and skipping the registration is invisible right
+  // up to the moment a reveal calls `openTab`, which then throws "no tab type is
+  // registered" for the rest of the session, forever, with nothing on screen.
+  // `ctx.inject` is the harness's own optional-registration path for exactly
+  // this (`schedule` uses it for `sessionProjections` on the host side).
+  ctx.inject(['sidebarRightTabs'], (scope) => {
+    const rightTabs = scope.get('sidebarRightTabs') as SidebarRightTabsFace | undefined
+    if (rightTabs === undefined) return
+    scope.effect(() => rightTabs.register(mentionsDefinition()), 'stock-portfolio: mention tab type')
+  })
+
+  // Stage two: the body, under the same key the definition's id names.
+  ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
+    name: 'sidebar.right.pane.tab',
+    key: MENTIONS_ID,
+    inject: face,
+  }, MentionsPanel))
 }
 
-export { PortfolioStore, createPortfolioStore } from './store.ts'
-export { SidebarEntry } from './SidebarEntry.tsx'
+// The entry's exports are for the tests: the shell consumes `apply` and
+// `inject` and nothing else. What is here is what a case reaches for — the cells
+// that cannot be mounted through a slot without a click or a conversation turn,
+// and the tab definition they register.
+export { createPortfolioStore, mentionedSymbols } from './store.ts'
 export { Dashboard } from './Dashboard.tsx'
-export { STYLES } from './styles.ts'
+export { Holdings } from './tabs/Holdings.tsx'
+export { Overview } from './tabs/Overview.tsx'
+export { SymbolDetail } from './SymbolDetail.tsx'
+export { MENTIONS_KIND, MentionsPanel, mentionsDefinition } from './MentionsPanel.tsx'
+

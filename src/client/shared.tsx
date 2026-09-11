@@ -9,10 +9,12 @@ import { money, percent, tone } from './format.ts'
 import type { BreakdownRow, Currency } from '../types.ts'
 
 /** A single headline number. */
-export function StatCard({ label, value, sub, toneClass, hint }: {
+export function StatCard({ label, value, sub, note, toneClass, hint }: {
   label: string
   value: string
   sub?: string | undefined
+  /** A third line: a breakdown of the headline number. */
+  note?: string | undefined
   toneClass?: string | undefined
   hint?: string | undefined
 }) {
@@ -21,16 +23,18 @@ export function StatCard({ label, value, sub, toneClass, hint }: {
       <div className="dsp-card-label">{label}</div>
       <div className={`dsp-card-value ${toneClass ?? ''}`}>{value}</div>
       {sub !== undefined && <div className="dsp-card-sub">{sub}</div>}
+      {note !== undefined && <div className="dsp-card-note">{note}</div>}
     </div>
   )
 }
 
 /** A P&L stat card: the amount in large type, the ratio beneath it. */
-export function PnlCard({ label, amount, ratio, currency, hint }: {
+export function PnlCard({ label, amount, ratio, currency, note, hint }: {
   label: string
   amount: number | null
   ratio: number | null
   currency: Currency
+  note?: string | undefined
   hint?: string | undefined
 }) {
   return (
@@ -38,6 +42,7 @@ export function PnlCard({ label, amount, ratio, currency, hint }: {
       label={label}
       value={money(amount, currency, { signed: true })}
       sub={ratio === null ? undefined : percent(ratio, { signed: true })}
+      note={note}
       toneClass={tone(amount)}
       hint={hint}
     />

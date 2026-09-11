@@ -207,8 +207,30 @@ async function route(service: PortfolioService, req: IncomingMessage, res: Serve
     return
   }
 
+  // The expanded holdings row: the stored bars for one symbol plus the
+  // indicators measured from them, in a single local read.
+  if (method === 'GET' && segments[0] === 'bars' && segments.length === 1) {
+    const symbol = url.searchParams.get('symbol') ?? ''
+    if (symbol.trim() === '') throw new PortfolioError('缺少 symbol 参数')
+    const limit = Number(url.searchParams.get('limit') ?? '160')
+    sendJson(res, 200, service.symbolBars(symbol, Number.isFinite(limit) && limit > 0 ? Math.min(limit, 1250) : 160))
+    return
+  }
+
   if (method === 'GET' && segments[0] === 'lookup' && segments.length === 1) {
     sendJson(res, 200, { matches: await service.lookup(url.searchParams.get('q') ?? '') })
+    return
+  }
+
+  // The conversation feed for ONE session: which of its turns named a portfolio
+  // symbol. Polled by the browser half, which reveals the mention pane when the
+  // revision moves. The session is a parameter because the pane follows the
+  // conversation on screen, and a history that was never scanned has to be
+  // scanned on demand — which is what reading the projection does.
+  if (method === 'GET' && segments[0] === 'mentions' && segments.length === 1) {
+    const session = url.searchParams.get('session') ?? ''
+    if (session.trim() === '') throw new PortfolioError('缺少 session 参数')
+    sendJson(res, 200, service.sessionMentions(session))
     return
   }
 
@@ -280,6 +302,7 @@ async function route(service: PortfolioService, req: IncomingMessage, res: Serve
         ? {}
         : { refreshIntervalMinutes: numberField(body, 'refreshIntervalMinutes', 0) },
       ...body['autoRefresh'] === undefined ? {} : { autoRefresh: body['autoRefresh'] === true },
+      ...body['mentionPopup'] === undefined ? {} : { mentionPopup: body['mentionPopup'] === true },
     })
     // A settings change alters every derived number, so answer with fresh state.
     sendJson(res, 200, { settings, state: service.state() })

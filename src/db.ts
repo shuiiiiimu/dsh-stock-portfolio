@@ -37,7 +37,7 @@ import { foldLedgers } from './portfolio.ts'
 import { currencyOfSymbol, exchangeOfSymbol } from './symbols.ts'
 import { PortfolioError } from './types.ts'
 import type {
-  Currency, Exchange, Instrument, InstrumentType, PriceBar, Quote, Trade, TradeSide,
+  Currency, Exchange, Instrument, InstrumentType, PriceBar, Quote, SymbolBar, Trade, TradeSide,
 } from './types.ts'
 
 /** The database file name inside the data directory. */
@@ -176,6 +176,8 @@ export interface StoredSettings {
   /** How often the background job re-reads daily bars. */
   readonly refreshIntervalMinutes: number
   readonly autoRefresh: boolean
+  /** Whether a conversation turn naming a held symbol pops the panel open. */
+  readonly mentionPopup: boolean
 }
 
 /** Settings as they stand before the user has changed anything. */
@@ -188,6 +190,9 @@ export const DEFAULT_SETTINGS: StoredSettings = {
   usdCny: 7.15,
   refreshIntervalMinutes: 360,
   autoRefresh: true,
+  // On by default: the popup is the feature, and the switch is there for the
+  // user who would rather read the answer without the panel moving.
+  mentionPopup: true,
 }
 
 /**
@@ -373,6 +378,8 @@ export class PortfolioDatabase {
       refreshIntervalMinutes: this.readSetting(raw, 'refreshIntervalMinutes', DEFAULT_SETTINGS.refreshIntervalMinutes,
         v => typeof v === 'number' && Number.isInteger(v) && v >= 15),
       autoRefresh: this.readSetting(raw, 'autoRefresh', DEFAULT_SETTINGS.autoRefresh,
+        v => typeof v === 'boolean'),
+      mentionPopup: this.readSetting(raw, 'mentionPopup', DEFAULT_SETTINGS.mentionPopup,
         v => typeof v === 'boolean'),
     }
   }
@@ -682,6 +689,24 @@ export class PortfolioDatabase {
       closes.set(symbol, rows)
     }
     return closes
+  }
+
+  /**
+   * Read one symbol's trailing daily bars, newest `limit` rows, ascending.
+   *
+   * The expanded holdings row draws from this: a close line, a volume column per
+   * bar, and the 60-bar window the indicators measure. Newest-first is the only
+   * order SQLite can answer without sorting the whole symbol, so the tail is
+   * selected descending and reversed here.
+   * @param symbol - the canonical symbol.
+   * @param limit - how many trailing bars to return.
+   * @returns ascending bars; empty when nothing has been fetched for the symbol.
+   */
+  readBars(symbol: string, limit: number): SymbolBar[] {
+    const rows = this.db.prepare(
+      'SELECT date, high, low, close, volume FROM prices WHERE symbol = ? ORDER BY date DESC LIMIT ?',
+    ).all(symbol, Math.max(1, Math.floor(limit))) as unknown as SymbolBar[]
+    return rows.reverse()
   }
 
   /**

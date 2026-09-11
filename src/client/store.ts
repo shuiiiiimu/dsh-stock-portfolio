@@ -10,7 +10,7 @@
  * changed.
  */
 import { ApiError, api } from './api.ts'
-import type { Currency, EquityPoint, PortfolioState, Trade, TradeInput } from '../types.ts'
+import type { Currency, EquityPoint, MentionBatch, MentionFeed, PortfolioState, Trade, TradeInput } from '../types.ts'
 
 /** The dashboard's sections, in navigation order. */
 export type TabId = 'overview' | 'holdings' | 'trades' | 'analysis' | 'settings'
@@ -35,6 +35,12 @@ export interface PortfolioSnapshot {
   /** The equity curve, loaded lazily for the overview tab. */
   readonly equity: readonly EquityPoint[]
   readonly equityStatus: 'idle' | 'loading' | 'ready' | 'error'
+  /** The watched session's mention feed, oldest batch first. */
+  readonly mentions: readonly MentionBatch[]
+  /** That session's newest revision seen, or `null` before its first poll answers. */
+  readonly mentionRev: number | null
+  /** The session the feed above belongs to, or `null` before anything is on screen. */
+  readonly mentionSession: string | null
 }
 
 /** The initial snapshot: closed, idle, nothing loaded. */
@@ -48,10 +54,66 @@ const INITIAL: PortfolioSnapshot = {
   toast: null,
   equity: [],
   equityStatus: 'idle',
+  mentions: [],
+  mentionRev: null,
+  mentionSession: null,
 }
 
 /** How long a toast stays up before it clears itself. */
 const TOAST_MS = 4000
+
+/**
+ * How often the browser asks whether the conversation mentioned something.
+ *
+ * A poll rather than a stream: the host answers from a projection it already
+ * folded, the payload is a handful of characters per turn, and a short interval
+ * means the pane appears with the answer instead of after it. Polling stops
+ * while the page is hidden and while no session is being watched.
+ */
+const MENTION_POLL_MS = 2_000
+
+/**
+ * How soon a reveal that did not land is retried.
+ *
+ * The one failure this exists for is a page load racing the Right Sidebar's
+ * seat: our first poll can be a few tens of milliseconds too early, and waiting
+ * a whole poll interval for the pane would read as "it did not open". Bounded,
+ * so a seat that never arrives costs a handful of requests rather than one every
+ * 300ms forever.
+ */
+const MENTION_RETRY_MS = 300
+
+/** How many fast retries before the normal poll cadence takes over. */
+const MENTION_RETRY_LIMIT = 10
+
+/**
+ * How often the sidebar's own number re-reads the snapshot.
+ *
+ * The footer row shows the day's move all the time, whether or not the panel is
+ * open, and it is the only part of this plugin that is visible without being
+ * asked for. Five minutes is a local request against the host's own database
+ * (the provider is only called on the host's schedule), and it is fast enough
+ * that a bar published mid-session shows up while the user is still looking at
+ * the sidebar.
+ */
+const SNAPSHOT_POLL_MS = 300_000
+
+/** What the store can be tuned with; the shipped defaults are the real ones. */
+export interface PortfolioStoreOptions {
+  /** Override the mention poll interval, in milliseconds. Tests use this. */
+  readonly mentionPollMs?: number
+  /**
+   * Called when a fresh conversation mention arrives, with the symbols it named.
+   *
+   * The store does not know how the Right Sidebar is opened — that is the client
+   * half's business, and in a deployment without one there is nothing to open —
+   * so revealing the pane is a callback rather than something the store does.
+   * Returning `false` says it did not land, and the store retries on its next
+   * tick: a fresh page load polls before the Right Sidebar's seat is bound, so
+   * the very first attempt can arrive too early to open anything.
+   */
+  readonly onMention?: ((symbols: readonly string[]) => boolean | void) | undefined
+}
 
 /** The dashboard's observable state machine. */
 export class PortfolioStore {
@@ -59,6 +121,33 @@ export class PortfolioStore {
   private readonly listeners = new Set<() => void>()
   private toastTimer: ReturnType<typeof setTimeout> | undefined
   private poll: ReturnType<typeof setInterval> | undefined
+  private mentionPoll: ReturnType<typeof setInterval> | undefined
+  private snapshotPoll: ReturnType<typeof setInterval> | undefined
+  /** The poll in flight, and the session it belongs to. */
+  private mentionInFlight: { session: string, task: Promise<void> } | null = null
+  /** Symbols whose reveal has not landed yet; retried until it does. */
+  private mentionPending: readonly string[] | null = null
+  private mentionRetries = 0
+  private mentionRetryTimer: ReturnType<typeof setTimeout> | undefined
+  /**
+   * Whether the mention pane is actually ON SCREEN, reported by the pane itself.
+   *
+   * Deliberately not "is it mounted" and not the column's layout state: the pane
+   * can stay mounted inside a collapsed column, and the layout can report itself
+   * expanded with this very tab active while the frame never drew it. Both
+   * readings suppress a reveal that the user is waiting for, so the pane measures
+   * itself instead (see `MentionsPanel`), and anything unmeasurable counts as
+   * hidden — opening a pane that is already open costs a focus, opening nothing
+   * costs the feature.
+   */
+  paneVisible = false
+  private readonly mentionPollMs: number
+  private readonly onMention: ((symbols: readonly string[]) => boolean | void) | undefined
+
+  constructor(options: PortfolioStoreOptions = {}) {
+    this.mentionPollMs = options.mentionPollMs ?? MENTION_POLL_MS
+    this.onMention = options.onMention
+  }
 
   /**
    * Read the current snapshot.
@@ -80,6 +169,12 @@ export class PortfolioStore {
   dispose(): void {
     clearTimeout(this.toastTimer)
     clearInterval(this.poll)
+    clearInterval(this.mentionPoll)
+    clearInterval(this.snapshotPoll)
+    clearTimeout(this.mentionRetryTimer)
+    this.mentionPoll = undefined
+    this.snapshotPoll = undefined
+    this.mentionRetryTimer = undefined
   }
 
   /**
@@ -125,6 +220,142 @@ export class PortfolioStore {
       return undefined
     })
     this.startPolling()
+  }
+
+  /**
+   * Keep the snapshot the sidebar row renders from.
+   *
+   * Independent of the panel: the footer row shows the day's move on every page,
+   * and before this existed the number only appeared once the user opened the
+   * dashboard (or a mention opened the pane) — which is exactly what a reader
+   * sees as "the badge is missing until I click it".
+   */
+  startSnapshotWatch(): void {
+    if (this.snapshotPoll !== undefined) return
+    void this.load({ quiet: true })
+    this.snapshotPoll = setInterval(() => {
+      // The panel's own poll already covers the open case, and this one is the
+      // slower of the two.
+      if (this.snapshot.open) return
+      void this.load({ quiet: true })
+    }, SNAPSHOT_POLL_MS)
+  }
+
+  // ─── conversation mentions ────────────────────────────────────────────────
+
+  /**
+   * Follow one session's conversation.
+   *
+   * Called by whatever is mounted for the session on screen — the mention pane
+   * itself, and the invisible registrar the header carries so that OPENING a
+   * session is enough, even one whose tab was never opened. Switching sessions
+   * drops the previous feed rather than showing another conversation's symbols
+   * under this one's name.
+   * @param sessionId - the session now on screen.
+   */
+  watchSession(sessionId: string): void {
+    if (this.snapshot.mentionSession !== sessionId) {
+      // A reveal owed to the session being left is not owed to this one.
+      this.mentionPending = null
+      this.mentionRetries = 0
+      this.set({ mentionSession: sessionId, mentions: [], mentionRev: null })
+    }
+    if (this.mentionPoll === undefined) {
+      this.mentionPoll = setInterval(() => { void this.pollMentions() }, this.mentionPollMs)
+    }
+    void this.pollMentions()
+  }
+
+  /**
+   * Ask the host what the conversation mentioned since the last look.
+   *
+   * One poll per session at a time: the interval and an explicit call (a session
+   * switch, or a test) can otherwise overlap, and two answers computed from the
+   * same cursor would both count as fresh — which is how a pane gets revealed
+   * twice for one turn.
+   * @returns the poll that answered, so callers can await it.
+   */
+  private pollMentions(): Promise<void> {
+    const sessionId = this.snapshot.mentionSession
+    if (sessionId === null) return Promise.resolve()
+    if (this.mentionInFlight?.session === sessionId) return this.mentionInFlight.task
+    const task = this.runMentionPoll(sessionId).finally(() => {
+      if (this.mentionInFlight?.task === task) this.mentionInFlight = null
+    })
+    this.mentionInFlight = { session: sessionId, task }
+    return task
+  }
+
+  /**
+   * Fetch one session's feed and act on it.
+   *
+   * Best-effort: a failed poll is silent, because the next one is two seconds
+   * away and there is nothing for the user to do about it.
+   * @param sessionId - the session this poll was started for.
+   */
+  private async runMentionPoll(sessionId: string): Promise<void> {
+    if (typeof document !== 'undefined' && document.hidden) return
+    let feed: MentionFeed
+    try {
+      feed = await api.mentions(sessionId)
+    } catch {
+      return
+    }
+    // A slower answer for a session the user has already left must not overwrite
+    // the one on screen.
+    if (this.snapshot.mentionSession !== sessionId) return
+    const previous = this.snapshot.mentionRev
+    // `previous === null` is this session's FIRST answer. It counts as fresh on
+    // purpose: a conversation opened from history already has its mentions — the
+    // projection folded them out of the stored log — and opening it IS the user
+    // asking to see them. The cost is that a page reload reveals the pane once
+    // for the conversation it lands on, which the 自动展开 switch turns off.
+    const fresh = previous === null ? feed.batches : feed.batches.filter(batch => batch.rev > previous)
+    this.set({ mentions: feed.batches, mentionRev: feed.rev })
+    const symbols = mentionedSymbols(fresh)
+    // A newer turn supersedes an undelivered one: both would open the same pane.
+    if (symbols.length > 0) this.mentionPending = symbols
+    this.deliverMention()
+  }
+
+  /**
+   * Try to reveal the pane for the mentions still owed to the user.
+   *
+   * Called on every tick, not only when a turn arrives: the first attempt of a
+   * page load can happen before the Right Sidebar has a session surface to open
+   * a tab in, and a reveal nobody retries is a pane that never appears.
+   */
+  private deliverMention(): void {
+    const symbols = this.mentionPending
+    if (symbols === null || this.onMention === undefined) {
+      this.mentionPending = null
+      return
+    }
+    // 自动弹出 off means the feed still fills the view, it just does not move the
+    // Right Sidebar: the user reads the mentions pane when they choose to.
+    if (this.snapshot.state?.settings.mentionPopup === false) {
+      this.mentionPending = null
+      return
+    }
+    if (this.onMention(symbols) === false) {
+      this.scheduleMentionRetry()
+      return
+    }
+    this.mentionPending = null
+    this.mentionRetries = 0
+  }
+
+  /**
+   * Come back for a reveal that did not land, well before the next poll.
+   *
+   * Gives up after {@link MENTION_RETRY_LIMIT} attempts: the interval keeps
+   * trying at its own cadence, and a retry storm helps nobody.
+   */
+  private scheduleMentionRetry(): void {
+    if (this.mentionRetries >= MENTION_RETRY_LIMIT) return
+    this.mentionRetries += 1
+    clearTimeout(this.mentionRetryTimer)
+    this.mentionRetryTimer = setTimeout(() => { void this.pollMentions() }, MENTION_RETRY_MS)
   }
 
   /** Close the dashboard and stop polling. */
@@ -374,9 +605,29 @@ function messageOf(error: unknown): string {
   return String(error)
 }
 
-/** Create the store the plugin registers on both slots' hook faces. */
-export function createPortfolioStore(): PortfolioStore {
-  return new PortfolioStore()
+/**
+ * The mentioned symbols, newest mention first and each symbol once.
+ *
+ * Ordering is the useful part: the panel lists what was just talked about at the
+ * top, so a follow-up answer about the same stock does not push a second copy of
+ * it onto the page.
+ * @param batches - the batches to read, oldest first.
+ * @returns canonical symbols.
+ */
+export function mentionedSymbols(batches: readonly MentionBatch[]): string[] {
+  const seen = new Set<string>()
+  const ordered: string[] = []
+  for (const batch of [...batches].reverse()) {
+    for (const symbol of batch.symbols) {
+      if (seen.has(symbol)) continue
+      seen.add(symbol)
+      ordered.push(symbol)
+    }
+  }
+  return ordered
 }
 
-export type { ApiError }
+/** Create the store the plugin registers on both slots' hook faces. */
+export function createPortfolioStore(options: PortfolioStoreOptions = {}): PortfolioStore {
+  return new PortfolioStore(options)
+}

@@ -93,6 +93,102 @@ export interface PriceBar {
   readonly amount: number
 }
 
+/**
+ * The subset of a daily bar the symbol detail view draws and measures.
+ *
+ * `open` and `amount` are stored but never read here: the expanded row shows a
+ * close line, a volume column per bar, and the high-low range of a window, so
+ * carrying the other two would only widen the payload.
+ */
+export interface SymbolBar {
+  /** Trading date, `YYYY-MM-DD`. */
+  readonly date: string
+  readonly high: number
+  readonly low: number
+  readonly close: number
+  readonly volume: number
+}
+
+/** One lookback window's move: how far the close travelled over N trading days. */
+export interface PeriodReturn {
+  /** The window, in trading days. */
+  readonly days: number
+  /** `lastClose - close N bars back`, in the symbol's own currency. */
+  readonly change: number | null
+  readonly pct: number | null
+}
+
+/**
+ * The indicators the expanded holdings row shows for one symbol.
+ *
+ * Everything here is derived from the stored daily bars alone — no second
+ * request, no provider call — so the whole block is a pure function of the
+ * series (see `indicators.ts`), which is what makes it testable without a
+ * network stub.
+ */
+export interface SymbolStats {
+  /** How many bars the window held. */
+  readonly barCount: number
+  readonly firstDate: string | null
+  readonly lastDate: string | null
+  readonly lastClose: number | null
+  /** 3 / 5 / 15 / 30 / 60-day moves, in that order. */
+  readonly returns: readonly PeriodReturn[]
+  /** Mean close over the last 20 bars. */
+  readonly ma20: number | null
+  /** `lastClose / ma20 - 1`. */
+  readonly ma20Gap: number | null
+  /** Annualized standard deviation of the last 20 daily returns. */
+  readonly volatility20: number | null
+  /** Latest volume over the mean of the 20 bars before it. */
+  readonly volumeRatio: number | null
+  /** Deepest peak-to-trough fall inside the last 60 bars, as a positive ratio. */
+  readonly maxDrawdown60: number | null
+  /** Where the latest close sits in the last 60 bars' range: 0 at the low, 1 at the high. */
+  readonly rangePosition60: number | null
+  readonly high60: number | null
+  readonly low60: number | null
+  /** Consecutive up (+) or down (−) closes ending at the latest bar. */
+  readonly streak: number
+}
+
+/** Which role a mention came from. */
+export type MentionSource = 'user' | 'assistant'
+
+/**
+ * One conversation turn that named at least one portfolio symbol.
+ *
+ * A batch, not a hit: the panel's 「提及」 view reacts to turns ("this answer is
+ * about 腾讯 and 茅台"), so a message mentioning two symbols is one event that
+ * carries two symbols rather than two events competing for the same popup.
+ *
+ * The text itself never leaves the host — only the symbols it matched and a
+ * short excerpt around the first hit.
+ */
+export interface MentionBatch {
+  /**
+   * Monotonic revision within the session, and the browser's change cursor: it
+   * counts turns that mentioned something, so it says "there is something new"
+   * without the client having to diff the list.
+   */
+  readonly rev: number
+  readonly source: MentionSource
+  /** Append time, epoch milliseconds. */
+  readonly at: number
+  /** Canonical symbols, in the order they were mentioned. */
+  readonly symbols: readonly string[]
+  /** A short line of the message around the first hit. */
+  readonly excerpt: string
+}
+
+/** The mention feed as the browser reads it: ONE session's, not the process's. */
+export interface MentionFeed {
+  /** The newest revision that session has reached; 0 when it never mentioned one. */
+  readonly rev: number
+  /** Recent batches, oldest first. */
+  readonly batches: readonly MentionBatch[]
+}
+
 /** The latest daily view of one symbol: the close, and the move since the one before. */
 export interface Quote {
   readonly symbol: string
@@ -143,6 +239,8 @@ export interface Position {
   readonly tradeCount: number
   readonly firstTradeAt: string
   readonly lastTradeAt: string
+  /** Whole days from the first buy to now, or `null` for an unparseable date. */
+  readonly holdingDays: number | null
   /** Share of the portfolio's converted market value; 0 when nothing has a price. */
   readonly weight: number
 }
@@ -207,6 +305,24 @@ export interface PortfolioStats {
   readonly openPositions: number
   readonly closedPositions: number
   readonly tradeCount: number
+  /** Open positions carrying an unrealized gain / loss right now. */
+  readonly unrealizedWinners: number
+  readonly unrealizedLosers: number
+  /** Sum of the winners' unrealized P&L, converted; never negative. */
+  readonly grossUnrealizedGain: number
+  /** Sum of the losers' unrealized P&L, converted; never positive. */
+  readonly grossUnrealizedLoss: number
+  /** The largest single position's share of the converted portfolio. */
+  readonly topWeight: number
+  /** That position's symbol, or `null` when there is nothing priced. */
+  readonly topSymbol: string | null
+  /** The three largest positions' combined share. */
+  readonly topThreeWeight: number
+  /** Mean days since the first buy, across open positions, or `null` when empty. */
+  readonly avgHoldingDays: number | null
+  readonly longestHoldingDays: number | null
+  /** The earliest first-buy date among open positions. */
+  readonly holdingSince: string | null
   /** Closed positions that ended in profit, over all closed positions. */
   readonly winRate: number | null
   readonly avgWin: number | null
@@ -286,6 +402,8 @@ export interface PortfolioSettings {
   /** How often the background job re-reads daily bars. */
   readonly refreshIntervalMinutes: number
   readonly autoRefresh: boolean
+  /** Whether a conversation turn that names a held symbol pops the panel open. */
+  readonly mentionPopup: boolean
   readonly dbPath: string
   /** How many instruments the local name index holds. */
   readonly instrumentCount: number
