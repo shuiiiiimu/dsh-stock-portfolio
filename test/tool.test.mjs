@@ -17,7 +17,8 @@ import { join } from 'node:path'
 import { after, test } from 'node:test'
 
 import {
-  ADD_TRADE_TOOL, OVERVIEW_TOOL, PortfolioService, createPortfolioTools, registerPortfolioTools,
+  ADD_TRADE_TOOL, ANALYSIS_TOOL, LIST_TRADES_TOOL, OVERVIEW_TOOL, SEARCH_TOOL, SYMBOL_DETAIL_TOOL,
+  PortfolioService, createPortfolioTools, registerPortfolioTools,
 } from '../lib/index.js'
 
 /** Noon on a fixed local day: every relative-date assertion is timezone-proof. */
@@ -551,13 +552,234 @@ test('the overview carries cleared positions only when asked', async () => {
   assert.equal(withClosed.closed[0].realized_pnl, 2000)
 })
 
+// ─── reading one symbol, the analysis and the index ──────────────────────────
+
+test('the symbol detail reads the stored series, its holding and its name', async () => {
+  const service = makeService()
+  const { capability, asked } = answerer([])
+  const tools = createPortfolioTools(service, { userQuestions: capability, now: () => NOW })
+
+  await run(tools, ADD_TRADE_TOOL, {
+    symbol: '00700.HK', side: 'buy', quantity: 100, price: 400, traded_at: '2026-09-10', ask_motive: false,
+  })
+
+  const detail = await run(tools, SYMBOL_DETAIL_TOOL, { symbol: '腾讯控股' })
+  assert.equal(asked.length, 0, 'a read of holdings data needs no permission')
+  assert.equal(detail.ok, true)
+  assert.equal(detail.symbol, '00700.HK')
+  assert.equal(detail.name, '腾讯控股')
+  assert.equal(detail.currency, 'HKD')
+  assert.equal(detail.history.bar_count, 2)
+  assert.equal(detail.history.last_close, 428.4)
+  assert.equal(detail.history.streak, 1)
+  assert.equal(detail.history.ma20, undefined, 'a window the series is too short for is absent, not zero')
+  assert.deepEqual(detail.recent_bars.map(bar => bar.date), ['2026-09-09', '2026-09-10'])
+  assert.equal(detail.position.quantity, 100)
+  assert.equal(detail.position.unrealized_pnl, 2840)
+  assert.deepEqual(detail.quote, { price: 428.4, date: '2026-09-10' })
+
+  const text = await view(tools, SYMBOL_DETAIL_TOOL, { symbol: '00700.HK' })
+  assert.match(text, /00700\.HK 腾讯控股：2 根日线（2026-09-09 → 2026-09-10）/)
+  assert.match(text, /00700\.HK 腾讯控股：100 股 · 仓位 100\.0% · 成本 400/)
+  assert.match(text, /最近 2 个交易日收盘：09-09 425\.6 · 09-10 428\.4/)
+  assert.match(text, /连涨 1 天/)
+})
+
+test('an ambiguous name is put to the user, and the pick is what gets read', async () => {
+  const service = makeService()
+  const { capability, asked } = answerer([{ id: 'symbol', selected: ['000001.SZ  平安银行'] }])
+  const tools = createPortfolioTools(service, { userQuestions: capability, now: () => NOW })
+
+  const detail = await run(tools, SYMBOL_DETAIL_TOOL, { symbol: '银行' })
+  assert.equal(asked.length, 1)
+  assert.equal(asked[0].questions[0].id, 'symbol')
+  assert.deepEqual(asked[0].questions[0].options.map(option => option.label), [
+    '000001.SZ  平安银行', '600000.SH  浦发银行',
+  ])
+  assert.equal(detail.ok, true)
+  assert.equal(detail.symbol, '000001.SZ')
+  assert.equal(detail.name, '平安银行')
+  assert.deepEqual(detail.asked, ['symbol'])
+})
+
+test('a subagent gets the candidates instead of a guess', async () => {
+  const service = makeService()
+  const tools = createPortfolioTools(service, { userQuestions: refusing('DELEGATED_CALLER'), now: () => NOW })
+
+  const detail = await run(tools, SYMBOL_DETAIL_TOOL, { symbol: '银行' }, { agent: { id: 'sub-1' } })
+  assert.equal(detail.ok, false)
+  assert.equal(detail.symbol, undefined)
+  assert.deepEqual(detail.matches.map(row => row.symbol).sort(), ['000001.SZ', '600000.SH'])
+  assert.equal(detail.questions[0].id, 'symbol')
+  assert.match(detail.message, /子代理会话没有人类回答者/)
+})
+
+test('an unknown name sends the model to the search tool', async () => {
+  const service = makeService()
+  const tools = createPortfolioTools(service, { now: () => NOW })
+
+  const detail = await run(tools, SYMBOL_DETAIL_TOOL, { symbol: '不存在的名字' })
+  assert.equal(detail.ok, false)
+  assert.match(detail.message, new RegExp(SEARCH_TOOL))
+})
+
+test('the search reads the local index, offline', async () => {
+  const service = makeService()
+  const tools = createPortfolioTools(service, { now: () => NOW })
+
+  const found = await run(tools, SEARCH_TOOL, { query: '腾讯' })
+  assert.equal(found.ok, true)
+  assert.deepEqual(found.matches.map(row => row.symbol), ['00700.HK'])
+  assert.equal(found.matches[0].name, '腾讯控股')
+  assert.equal(found.matches[0].exchange, 'HK')
+  assert.equal(found.matches[0].currency, 'HKD')
+
+  const text = await view(tools, SEARCH_TOOL, { query: '00700' })
+  assert.match(text, /- 00700\.HK 腾讯控股 · HK · HKD · stock/)
+
+  const nothing = await run(tools, SEARCH_TOOL, { query: '不存在的名字' })
+  assert.equal(nothing.ok, false)
+  assert.deepEqual(nothing.matches, [])
+})
+
+test('the analysis groups by motive and ranks the symbols', async () => {
+  const service = makeService()
+  const { capability, asked } = answerer([])
+  const tools = createPortfolioTools(service, { userQuestions: capability, now: () => NOW })
+
+  await run(tools, ADD_TRADE_TOOL, {
+    symbol: '600000.SH', side: 'buy', quantity: 1000, price: 9, traded_at: '2026-09-01', motive: '回调加仓',
+  })
+  await run(tools, ADD_TRADE_TOOL, {
+    symbol: '600000.SH', side: 'sell', quantity: 1000, price: 11, traded_at: '2026-09-08', motive: '止盈',
+  })
+
+  const analysis = await run(tools, ANALYSIS_TOOL, {})
+  assert.equal(asked.length, 0, 'aggregates need no permission')
+  assert.equal(analysis.ok, true)
+  assert.equal(analysis.base_currency, 'CNY')
+  assert.equal(analysis.ratios.closed_positions, 1)
+  assert.equal(analysis.ratios.open_positions, 0)
+  assert.equal(analysis.ratios.win_rate, 1)
+  assert.deepEqual(analysis.by_motive.map(row => row.key).sort(), ['回调加仓', '止盈'])
+  assert.equal(analysis.by_motive.find(row => row.key === '止盈').realized_pnl, 2000)
+  assert.equal(analysis.closed[0].realized_pnl, 2000)
+  assert.deepEqual(analysis.ranking, [], 'nothing is open after the sell')
+
+  const text = await view(tools, ANALYSIS_TOOL, {})
+  assert.match(text, /已实现 \+2000\.00 CNY（1 次清仓、2 笔交易）/)
+  assert.match(text, /止盈：1 笔 · 已实现 \+2000\.00/)
+  assert.match(text, /（已清仓）600000\.SH 浦发银行：2026-09-01 → 2026-09-08/)
+})
+
+// ─── the trade log, behind a consent card ────────────────────────────────────
+
+/**
+ * Two trades, one of them carrying a motive — the rows a trade read returns.
+ * @returns the service and the tools.
+ */
+function tradeFixture() {
+  const service = makeService()
+  const tools = (capability) => createPortfolioTools(service, { userQuestions: capability, now: () => NOW })
+  return { service, tools }
+}
+
+test('the trade read returns rows only after the user agrees', async () => {
+  const { service, tools } = tradeFixture()
+  const { capability, asked } = answerer([{ id: 'consent', selected: ['允许这一次'] }])
+  const definitions = tools(capability)
+
+  await run(definitions, ADD_TRADE_TOOL, {
+    symbol: '600000.SH', side: 'buy', quantity: 1000, price: 9, traded_at: '2026-09-01', motive: '回调加仓',
+  })
+  await run(definitions, ADD_TRADE_TOOL, {
+    symbol: '00700.HK', side: 'buy', quantity: 100, price: 400, traded_at: '2026-09-10', ask_motive: false,
+  })
+
+  const read = await run(definitions, LIST_TRADES_TOOL, {})
+  assert.equal(asked.length, 1, 'the card is the first thing the read does')
+  assert.equal(asked[0].questions[0].id, 'consent')
+  assert.deepEqual(asked[0].questions[0].options.map(option => option.label), ['允许这一次', '不允许'])
+  assert.equal(read.ok, true)
+  assert.equal(read.consent, 'granted')
+  assert.equal(read.count, 2)
+  assert.equal(read.truncated, false)
+  assert.deepEqual(read.trades.map(row => row.symbol), ['00700.HK', '600000.SH'], 'newest first')
+  assert.equal(read.trades[1].motive, '回调加仓')
+  assert.equal(read.trades[0].name, '腾讯控股', 'the name comes from the index when the row has none')
+  assert.equal(service.db.listTrades().length, 2, 'a read never writes')
+
+  const filtered = await run(definitions, LIST_TRADES_TOOL, { symbol: '600000', since: '2026-09-01' })
+  assert.equal(filtered.count, 1)
+  assert.equal(filtered.trades[0].symbol, '600000.SH')
+  assert.equal(filtered.filter.symbol, '600000')
+
+  const text = await view(definitions, LIST_TRADES_TOOL, { symbol: '600000' })
+  assert.match(text, /#\d+ 2026-09-01 买入 600000\.SH 浦发银行 1000 @ 9 CNY（动机：回调加仓）/)
+})
+
+test('a refused card returns no rows at all', async () => {
+  const { tools } = tradeFixture()
+  const { capability } = answerer([{ id: 'consent', selected: ['不允许'] }])
+  const definitions = tools(capability)
+
+  await run(definitions, ADD_TRADE_TOOL, {
+    symbol: '600000.SH', side: 'buy', quantity: 1000, price: 9, traded_at: '2026-09-01', ask_motive: false,
+  })
+
+  const read = await run(definitions, LIST_TRADES_TOOL, {})
+  assert.equal(read.ok, false)
+  assert.equal(read.consent, 'declined')
+  assert.equal(read.trades, undefined)
+  assert.equal(read.count, undefined)
+  assert.match(read.message, /没有同意/)
+})
+
+test('an unanswered card is a refusal too', async () => {
+  const { tools } = tradeFixture()
+  const { capability } = answerer([{ id: 'consent', custom: '以后再说' }])
+  const definitions = tools(capability)
+
+  const read = await run(definitions, LIST_TRADES_TOOL, {})
+  assert.equal(read.ok, false)
+  assert.equal(read.consent, 'declined')
+  assert.equal(read.trades, undefined)
+})
+
+test('a subagent is told to ask the human itself, and reads nothing', async () => {
+  const { tools } = tradeFixture()
+  const definitions = tools(refusing('DELEGATED_CALLER'))
+
+  const read = await run(definitions, LIST_TRADES_TOOL, {}, { agent: { id: 'sub-1' } })
+  assert.equal(read.ok, false)
+  assert.equal(read.consent, 'declined')
+  assert.equal(read.trades, undefined)
+  assert.equal(read.questions[0].id, 'consent')
+  assert.match(read.message, /必须由用户当面同意/)
+
+  const text = await view(definitions, LIST_TRADES_TOOL, {})
+  assert.match(text, /需要向用户确认/)
+  assert.match(text, /允许这一次/)
+})
+
+test('the consent card names exactly what the read would cover', async () => {
+  const { tools } = tradeFixture()
+  const { capability, asked } = answerer([{ id: 'consent', selected: ['不允许'] }])
+  const definitions = tools(capability)
+
+  await run(definitions, LIST_TRADES_TOOL, { symbol: '腾讯', side: 'sell', since: '2026-01-01', until: '2026-09-10' })
+  assert.match(asked[0].questions[0].detail, /只看「腾讯」、只看卖出、2026-01-01 起、到 2026-09-10 为止/)
+})
+
 // ─── what the registry is handed ─────────────────────────────────────────────
 
 test('every declared schema stays inside the enforced subset', () => {
   const service = makeService()
   const tools = createPortfolioTools(service, { now: () => NOW })
 
-  assert.deepEqual(tools.map(tool => tool.name), [ADD_TRADE_TOOL, OVERVIEW_TOOL])
+  assert.deepEqual(tools.map(tool => tool.name), [
+    ADD_TRADE_TOOL, OVERVIEW_TOOL, SYMBOL_DETAIL_TOOL, ANALYSIS_TOOL, SEARCH_TOOL, LIST_TRADES_TOOL,
+  ])
   for (const tool of tools) {
     assert.deepEqual(schemaViolations(tool.output.schema), [], `${tool.name} output schema`)
     assert.equal(tool.parameters.type, 'object')
@@ -566,7 +788,7 @@ test('every declared schema stays inside the enforced subset', () => {
   }
 })
 
-test('registration publishes both tools and disposes with the plugin', () => {
+test('registration publishes every tool and disposes with the plugin', () => {
   const service = makeService()
   const registered = []
   const disposed = []
@@ -580,9 +802,12 @@ test('registration publishes both tools and disposes with the plugin', () => {
 
   registerPortfolioTools(ctx, service)
 
-  assert.deepEqual(registered, [ADD_TRADE_TOOL, OVERVIEW_TOOL])
+  const expected = [
+    ADD_TRADE_TOOL, OVERVIEW_TOOL, SYMBOL_DETAIL_TOOL, ANALYSIS_TOOL, SEARCH_TOOL, LIST_TRADES_TOOL,
+  ]
+  assert.deepEqual(registered, expected)
   for (const disposer of disposers) disposer()
-  assert.deepEqual(disposed, [ADD_TRADE_TOOL, OVERVIEW_TOOL])
+  assert.deepEqual(disposed, expected)
 })
 
 test('a composition without a tool registry is a note, not a crash', () => {

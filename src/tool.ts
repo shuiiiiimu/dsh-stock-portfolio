@@ -37,6 +37,22 @@
  * together with the questions it would have asked, so the calling model can put
  * them to the user with its own `ask_user_question` tool and call back.
  *
+ * ## Reads, and the one that asks first
+ *
+ * The read side mirrors the panel: holdings and totals, one symbol's stored
+ * series and its indicators, the aggregate analysis, and the local index. None
+ * of them interrupts the user — they are the same numbers the dashboard is
+ * already showing on screen, and they cost no provider quota.
+ *
+ * The trade log's individual rows are different. A row carries what the user
+ * paid, why they paid it, and whatever else they wrote down, so
+ * `stock_list_trades` asks through `ctx.userQuestions` before every read and
+ * returns rows only for a clear yes. A refusal, a dismissed card, an unreadable
+ * answer, and a caller with nobody to ask all end the same way: a result with no
+ * records in it, carrying the question the caller can put to the user itself.
+ * The permission is never remembered — “may I look” is a question about this
+ * read, not a setting.
+ *
  * ## What is not here
  *
  * No HTTP, no SQL and no portfolio arithmetic. The service is called for every
@@ -47,7 +63,9 @@ import { MOTIVE_HISTORY_LIMIT, MOTIVE_PRESETS } from './motives.ts'
 import { exchangeLabel, normalizeSymbol } from './symbols.ts'
 import { PortfolioError } from './types.ts'
 import type { PortfolioService } from './service.ts'
-import type { Currency, Position, Quote, SymbolMatch, Trade, TradeSide } from './types.ts'
+import type {
+  BreakdownRow, ClosedPosition, Currency, Position, Quote, SymbolBar, SymbolMatch, SymbolStats, Trade, TradeSide,
+} from './types.ts'
 import type { Context } from '@deepseek-ai/cordis'
 
 // ─── the harness surface this module consumes ────────────────────────────────
@@ -145,11 +163,41 @@ export const ADD_TRADE_TOOL = 'stock_add_trade'
 /** Reports positions and profit. */
 export const OVERVIEW_TOOL = 'stock_portfolio_overview'
 
+/** One symbol's stored daily series, its indicators and its holding. */
+export const SYMBOL_DETAIL_TOOL = 'stock_symbol_detail'
+
+/** The aggregate analysis: motives, markets, ranking and ratios. */
+export const ANALYSIS_TOOL = 'stock_analysis'
+
+/** Local instrument-index search. */
+export const SEARCH_TOOL = 'stock_search_symbols'
+
+/** The trade log's individual rows, behind an explicit consent card. */
+export const LIST_TRADES_TOOL = 'stock_list_trades'
+
 /** How many candidate symbols one question offers before the user must type. */
 const SYMBOL_CHOICES = 5
 
 /** How many position rows one overview reply carries before it says it truncated. */
 const POSITION_LIMIT = 40
+
+/** How many trailing daily bars a symbol read asks the store for, and its cap. */
+const DETAIL_BARS = 120
+const DETAIL_BARS_MAX = 500
+
+/** How many of the newest bars the model is shown as a series. */
+const RECENT_BARS = 30
+
+/** How many of the newest trades one consent-gated read returns, and its cap. */
+const TRADE_LIMIT = 50
+const TRADE_LIMIT_MAX = 200
+
+/** How many index hits one search returns, and its cap. */
+const SEARCH_LIMIT = 8
+const SEARCH_LIMIT_MAX = 30
+
+/** How many ranking rows one analysis returns. */
+const RANKING_LIMIT = 15
 
 /** A trade that can still be sold short of what it holds is not the tool's call. */
 const DESCRIPTION_ADD_TRADE = '把一笔股票 / ETF / 可转债交易记进 DSH 股票持仓插件的本地交易记录（与侧边栏「股票持仓」面板同一份数据）。'
@@ -161,6 +209,26 @@ const DESCRIPTION_ADD_TRADE = '把一笔股票 / ETF / 可转债交易记进 DSH
 
 const DESCRIPTION_OVERVIEW = '读取 DSH 股票持仓插件里的持仓与盈亏（与侧边栏「股票持仓」面板同一份数据）：按最新日线收盘价估值的持仓明细、'
   + '总市值、浮动 / 已实现盈亏、当日盈亏、分币种小计。用户问「我现在持仓怎么样」「某只赚了多少」时调用它，不要靠记忆回答。'
+
+const DESCRIPTION_SYMBOL_DETAIL = '读取 DSH 股票持仓插件里某一个标的的本地日线与持仓统计（与侧边栏「股票持仓」面板同一份 SQLite 数据）：'
+  + '最新收盘价与日期、最近若干交易日的收盘 / 成交量，以及 3/5/15/30/60 日涨跌幅、20 日均线偏离、20 日波动率、量比、'
+  + '60 日区间与最大回撤、连续涨跌天数，并附该标的的持仓（数量、成本、市值、浮动 / 已实现盈亏、持有天数）与清仓历史。'
+  + '用户问「腾讯最近走势怎么样」「茅台这几天涨了多少」「这只波动大不大」时调用它，不要靠记忆回答。'
+  + '标的名有歧义时会在同一次调用里弹一张卡片让用户挑，已经说得清楚就一张都不弹；全部读本地日线，不额外请求行情接口。'
+
+const DESCRIPTION_ANALYSIS = '读取 DSH 股票持仓插件的聚合分析（与面板「分析」分区同一份数据）：按交易动机归集的已实现 / 浮动盈亏、按市场的分布、'
+  + '标的表现排行、清仓历史，以及胜率、平均盈亏、盈亏比、最好 / 最差标的等比率。'
+  + '用户问「我在哪个动机上赚得多」「哪只最赚」「我的胜率多少」时调用它。'
+  + '这里只有聚合口径，不含单笔成交的价格、动机与备注；要看单笔明细用 stock_list_trades，它会先问用户同意。'
+
+const DESCRIPTION_SEARCH = '在 DSH 股票持仓插件的本地代码索引里检索标的（全市场规模，离线、即时）：按代码或名称片段返回规范代码、名称、交易所、币种与类型。'
+  + '用户问「腾讯的代码是什么」「有哪些叫平安的标的」，或需要把一句话里的名称换成规范代码时调用它。'
+  + '查询走本地索引，索引里查不到时才会尝试一次接口探测；这是纯查询，不读写用户的任何交易数据。'
+
+const DESCRIPTION_LIST_TRADES = '读取 DSH 股票持仓插件里的单笔交易记录明细（与面板「交易」分区同一份数据）：成交日期、方向、数量、价格、动机、备注。'
+  + '交易记录是用户的隐私数据，这个工具在读取前会自动弹一张授权卡片问用户，用户同意才返回明细，拒绝或没回答都不会返回任何记录。'
+  + '所以用户明确说「看看我的交易记录 / 我那几笔买卖」时直接调用它，不要自己先反问；用户没说就别主动读。'
+  + '只读，不修改任何记录：改一笔、删一笔仍然在面板里做。'
 
 // ─── parsing and formatting ──────────────────────────────────────────────────
 
@@ -197,6 +265,21 @@ function numberIn(text: string | null): number | null {
   if (match === null) return null
   const value = Number(match[0])
   return Number.isFinite(value) ? value : null
+}
+
+/**
+ * Turn an optional count into a bounded row limit.
+ *
+ * A read is bounded on purpose: the model asks for what it needs, and a reply
+ * that would bury the conversation is worse than one that says it truncated.
+ * @param value - the model's number, or anything else.
+ * @param fallback - the limit used when it said nothing usable.
+ * @param max - the hard ceiling.
+ * @returns a positive integer.
+ */
+function clampLimit(value: number | null, fallback: number, max: number): number {
+  if (value === null || !Number.isFinite(value) || value <= 0) return fallback
+  return Math.min(Math.floor(value), max)
 }
 
 /** A number as the user should read it: no float noise, no trailing zeros. */
@@ -288,6 +371,24 @@ function toResolved(match: SymbolMatch): Resolved {
 }
 
 /**
+ * The canonical spelling of a query that is already a code.
+ *
+ * Used to widen a filter rather than to resolve one: a user's trade log stores
+ * `600000.SH`, and a filter of `600000` has to find it without the tool having
+ * to guess an exchange it was not asked about.
+ * @param query - the raw text.
+ * @returns the canonical symbol, or `null` when the text is not a code.
+ */
+function canonicalSymbol(query: string | null): string | null {
+  if (query === null) return null
+  try {
+    return normalizeSymbol(query).symbol
+  } catch {
+    return null
+  }
+}
+
+/**
  * Turn what the user called an instrument into a canonical symbol.
  *
  * The local index answers first — it is what makes “腾讯控股” work — and a query
@@ -373,7 +474,10 @@ function quoteFor(service: PortfolioService, symbol: string | null, now: Date): 
 // ─── questions ───────────────────────────────────────────────────────────────
 
 /** The question asking for a symbol, with index hits as options when available. */
-function symbolQuestion(candidates: readonly SymbolMatch[]): UserQuestion {
+function symbolQuestion(
+  candidates: readonly SymbolMatch[],
+  question = '这笔交易是哪个标的？',
+): UserQuestion {
   const options = candidates.slice(0, SYMBOL_CHOICES).map(candidate => ({
     label: candidate.name === null ? candidate.symbol : `${candidate.symbol}  ${candidate.name}`,
     description: exchangeLabel(candidate.exchange),
@@ -381,7 +485,7 @@ function symbolQuestion(candidates: readonly SymbolMatch[]): UserQuestion {
   return {
     id: 'symbol',
     header: '标的',
-    question: '这笔交易是哪个标的？',
+    question,
     detail: '可以直接输入代码（600000.SH / 00700.HK / AAPL.US）或名称，例如「腾讯控股」「贵州茅台」',
     ...options.length === 0 ? {} : { options },
   }
@@ -465,6 +569,65 @@ function motiveQuestion(side: TradeSide | null, used: readonly string[]): UserQu
     detail: '会用于按动机统计盈亏；可以选一个，也可以自己写',
     options: [...presets, ...history, '不记录动机'].map(label => ({ label })),
   }
+}
+
+/** The label the consent card offers for “yes”, and the only one that reads. */
+const CONSENT_ALLOW = '允许这一次'
+
+/**
+ * The card that stands between the model and the trade log.
+ *
+ * Trade rows carry what the user paid, why, and whatever they wrote down — the
+ * most personal table in the database — so a read of them is asked for out loud
+ * rather than inferred from the conversation. The card is per read and says so:
+ * a plugin cannot know that this afternoon's question is the same permission.
+ * @param scope - what this particular read would cover, in one phrase.
+ * @returns the question.
+ */
+function consentQuestion(scope: string): UserQuestion {
+  return {
+    id: 'consent',
+    header: '交易记录',
+    question: '要读取你的交易记录明细吗？',
+    detail: `${scope}。交易记录含每笔成交的价格、动机与备注，这次同意只对这一次读取有效。`,
+    options: [
+      { label: CONSENT_ALLOW, description: '返回本次请求的交易明细' },
+      { label: '不允许', description: '不读取，也不返回任何明细' },
+    ],
+  }
+}
+
+/**
+ * Whether an answer to the consent card is a yes.
+ *
+ * The card offers one “yes” label, but the answerer is a waterfall and a user
+ * can always type instead. Free text only counts as permission when it actually
+ * says so — everything unreadable, skipped or negative is a refusal, because the
+ * cost of the two mistakes is not symmetric.
+ * @param answer - the answer text, or `null` when nothing came back.
+ * @returns true only for an unambiguous yes.
+ */
+function consentGranted(answer: string | null): boolean {
+  if (answer === null) return false
+  const text = answer.trim()
+  if (text.startsWith('不允许') || text.includes('不同意') || text.includes('拒绝')) return false
+  return text.startsWith('允许') || text.includes('同意') || text.includes('可以') || text === '好'
+}
+
+/**
+ * One phrase describing exactly what a trade read would cover.
+ * @param filter - the filters that will be applied, already parsed.
+ * @param limit - the row cap.
+ * @returns the phrase, for the consent card and the reply.
+ */
+function describeTradeScope(filter: Readonly<Record<string, unknown>>, limit: number): string {
+  const parts: string[] = []
+  if (typeof filter['symbol'] === 'string') parts.push(`只看「${filter['symbol']}」`)
+  if (filter['side'] === 'buy') parts.push('只看买入')
+  if (filter['side'] === 'sell') parts.push('只看卖出')
+  if (typeof filter['since'] === 'string') parts.push(`${filter['since']} 起`)
+  if (typeof filter['until'] === 'string') parts.push(`到 ${filter['until']} 为止`)
+  return `${parts.length === 0 ? '全部交易记录' : parts.join('、')}，最多 ${String(limit)} 笔`
 }
 
 // ─── answers ─────────────────────────────────────────────────────────────────
@@ -551,30 +714,47 @@ async function adoptSymbolAnswer(
   service: PortfolioService,
   notes: string[],
 ): Promise<void> {
+  const match = await symbolFromAnswer(service, answer, notes)
+  if (match === null) return
+  draft.symbol = match.symbol
+  draft.name = match.name
+  draft.exchange = match.exchange
+  draft.currency = match.currency
+}
+
+/**
+ * Resolve the symbol a user's answer names.
+ *
+ * An option label leads with the canonical symbol; anything else is text the
+ * user typed and goes back through the same resolver. A still-ambiguous answer
+ * resolves to its first candidate and says so, because a second question card
+ * over a symbol the user just chose is worse than a note they can correct.
+ * @param service - the portfolio service.
+ * @param answer - the answer text.
+ * @param notes - collected remarks for the reply.
+ * @returns the resolved symbol, or `null` when nothing could be made of it.
+ */
+async function symbolFromAnswer(
+  service: PortfolioService,
+  answer: string,
+  notes: string[],
+): Promise<Resolved | null> {
   const leading = /^[A-Za-z0-9][A-Za-z0-9.-]*/u.exec(answer)?.[0]
   const query = leading !== undefined && leading.includes('.') ? leading : answer
   const resolution = await resolveSymbol(service, query)
   if (resolution.kind === 'resolved') {
-    draft.symbol = resolution.match.symbol
-    draft.name = resolution.match.name
-    draft.exchange = resolution.match.exchange
-    draft.currency = resolution.match.currency
     if (resolution.note !== null) notes.push(resolution.note)
-    return
+    return resolution.match
   }
   if (resolution.kind === 'ambiguous') {
     const first = resolution.matches[0]
     if (first !== undefined) {
-      const match = toResolved(first)
-      draft.symbol = match.symbol
-      draft.name = match.name
-      draft.exchange = match.exchange
-      draft.currency = match.currency
-      notes.push(`「${answer}」有 ${String(resolution.matches.length)} 个候选，取了第一个 ${match.symbol}`)
-      return
+      notes.push(`「${answer}」有 ${String(resolution.matches.length)} 个候选，取了第一个 ${first.symbol}`)
+      return toResolved(first)
     }
   }
   notes.push(`无法把「${answer}」识别成标的，请让用户给出代码，例如 600000.SH`)
+  return null
 }
 
 /**
@@ -669,6 +849,102 @@ function projectTrade(trade: Trade): Record<string, unknown> {
     ...trade.name === null ? {} : { name: trade.name },
     ...trade.motive === null ? {} : { motive: trade.motive },
     ...trade.note === null ? {} : { note: trade.note },
+  }
+}
+
+/** One index hit as the model reads it. */
+function projectMatch(match: SymbolMatch): Record<string, unknown> {
+  return {
+    symbol: match.symbol,
+    exchange: match.exchange,
+    currency: match.currency,
+    ...match.name === null ? {} : { name: match.name },
+    ...match.type === null ? {} : { type: match.type },
+  }
+}
+
+/** One cleared position as the model reads it. */
+function projectClosed(row: ClosedPosition): Record<string, unknown> {
+  return {
+    symbol: row.symbol,
+    exchange: row.exchange,
+    currency: row.currency,
+    realized_pnl: row.realizedPnl,
+    cost_sold: row.costSold,
+    proceeds: row.proceeds,
+    trade_count: row.tradeCount,
+    opened_at: row.openedAt,
+    closed_at: row.closedAt,
+    ...row.name === null ? {} : { name: row.name },
+  }
+}
+
+/** One grouped breakdown row (by motive, or by market). */
+function projectBreakdown(row: BreakdownRow): Record<string, unknown> {
+  return {
+    key: row.key,
+    label: row.label,
+    trades: row.trades,
+    realized_pnl: row.realizedPnl,
+    unrealized_pnl: row.unrealizedPnl,
+    total_pnl: row.totalPnl,
+    market_value: row.marketValue,
+  }
+}
+
+/** One ranking row: a position's booked and paper result side by side. */
+function projectRanking(row: Position): Record<string, unknown> {
+  const unrealized = row.unrealizedPnl
+  return {
+    symbol: row.symbol,
+    currency: row.currency,
+    trade_count: row.tradeCount,
+    realized_pnl: row.realizedPnl,
+    total_pnl: row.realizedPnl + (unrealized ?? 0),
+    weight: row.weight,
+    ...row.name === null ? {} : { name: row.name },
+    ...unrealized === null ? {} : { unrealized_pnl: unrealized },
+    ...row.marketValue === null ? {} : { market_value: row.marketValue },
+  }
+}
+
+/**
+ * The indicator block, with every unknown left out rather than sent as `null`.
+ *
+ * A window shorter than its lookback has no answer, and the model must be able
+ * to tell “no number” from “zero” — so an absent key is the whole signal.
+ */
+function projectIndicators(stats: SymbolStats): Record<string, unknown> {
+  return {
+    bar_count: stats.barCount,
+    streak: stats.streak,
+    returns: stats.returns.map(period => ({
+      days: period.days,
+      ...period.change === null ? {} : { change: period.change },
+      ...period.pct === null ? {} : { pct: period.pct },
+    })),
+    ...stats.firstDate === null ? {} : { first_date: stats.firstDate },
+    ...stats.lastDate === null ? {} : { last_date: stats.lastDate },
+    ...stats.lastClose === null ? {} : { last_close: stats.lastClose },
+    ...stats.ma20 === null ? {} : { ma20: stats.ma20 },
+    ...stats.ma20Gap === null ? {} : { ma20_gap: stats.ma20Gap },
+    ...stats.volatility20 === null ? {} : { volatility20: stats.volatility20 },
+    ...stats.volumeRatio === null ? {} : { volume_ratio: stats.volumeRatio },
+    ...stats.maxDrawdown60 === null ? {} : { max_drawdown60: stats.maxDrawdown60 },
+    ...stats.rangePosition60 === null ? {} : { range_position60: stats.rangePosition60 },
+    ...stats.high60 === null ? {} : { high60: stats.high60 },
+    ...stats.low60 === null ? {} : { low60: stats.low60 },
+  }
+}
+
+/** One daily bar as the model reads it. */
+function projectBar(bar: SymbolBar): Record<string, unknown> {
+  return {
+    date: bar.date,
+    close: bar.close,
+    high: bar.high,
+    low: bar.low,
+    volume: bar.volume,
   }
 }
 
@@ -907,25 +1183,480 @@ function executeOverview(rawArgs: unknown, service: PortfolioService): Record<st
     positions: rows,
     positions_truncated: positions.length > rows.length,
     ...closed.length === 0 ? {} : {
-      closed: closed.map(row => ({
-        symbol: row.symbol,
-        exchange: row.exchange,
-        currency: row.currency,
-        realized_pnl: row.realizedPnl,
-        cost_sold: row.costSold,
-        proceeds: row.proceeds,
-        trade_count: row.tradeCount,
-        opened_at: row.openedAt,
-        closed_at: row.closedAt,
-        ...row.name === null ? {} : { name: row.name },
-      })),
+      closed: closed.map(projectClosed),
     },
     ...filter === null ? {} : { filter },
     rates_note: `折算基准货币 ${stats.baseCurrency}；分币种小计见 native，均为各自币种的原始数值`,
   }
 }
 
+/**
+ * Search the local instrument index.
+ *
+ * The index is the same one the trade form's suggestion list reads, so a code
+ * found here is a code the write path will accept.
+ * @param rawArgs - the model's arguments.
+ * @param service - the portfolio service.
+ * @returns the tool's canonical result value.
+ */
+async function executeSearch(rawArgs: unknown, service: PortfolioService): Promise<Record<string, unknown>> {
+  const args = asRecord(rawArgs)
+  const query = textOf(args['query'])
+  if (query === null) {
+    return { ok: false, message: '要查哪个标的？把代码或名称传进来，例如「腾讯控股」「00700.HK」「AAPL」。' }
+  }
+  const limit = clampLimit(numberOf(args['limit']), SEARCH_LIMIT, SEARCH_LIMIT_MAX)
+  const found = await service.lookup(query)
+  const matches = found.slice(0, limit).map(projectMatch)
+  const truncated = found.length > matches.length
+  return {
+    ok: matches.length > 0,
+    message: matches.length === 0
+      ? `本地代码索引里没有「${query}」。可以试完整代码（600000.SH / 00700.HK / AAPL.US）或名称的一部分。`
+      : `本地代码索引里匹配「${query}」的 ${String(found.length)} 条`
+        + `${truncated ? `，列出前 ${String(matches.length)} 条` : ''}`,
+    query,
+    matches,
+    truncated,
+  }
+}
+
+/**
+ * Read one symbol: its stored daily series, the indicators measured from it,
+ * and whatever position the log holds for it.
+ *
+ * The series is local, so this costs no provider quota and works offline. A name
+ * with several index hits is put to the user in the same call rather than
+ * guessed: reading the wrong 平安 is a wrong answer the model cannot detect.
+ * @param rawArgs - the model's arguments.
+ * @param exec - the execution context.
+ * @param service - the portfolio service.
+ * @param deps - the tool's capabilities.
+ * @returns the tool's canonical result value.
+ */
+async function executeSymbolDetail(
+  rawArgs: unknown,
+  exec: ToolRunContext,
+  service: PortfolioService,
+  deps: PortfolioToolDeps,
+): Promise<Record<string, unknown>> {
+  const args = asRecord(rawArgs)
+  const notes: string[] = []
+  const asked: string[] = []
+  const dictated = textOf(args['symbol'])
+  if (dictated === null) {
+    return { ok: false, message: '要看哪个标的？把代码或名称传进来，例如「00700.HK」「腾讯控股」。' }
+  }
+
+  const resolution = await resolveSymbol(service, dictated)
+  let match: Resolved | null = null
+  if (resolution.kind === 'resolved') {
+    match = resolution.match
+    if (resolution.note !== null) notes.push(resolution.note)
+  } else if (resolution.kind === 'ambiguous') {
+    const question = symbolQuestion(resolution.matches, '要看哪个标的？')
+    const outcome = await askUser(deps, [question], exec)
+    if (outcome.kind === 'answered') {
+      asked.push('symbol')
+      match = await symbolFromAnswer(service, answerText(outcome.answers, 'symbol') ?? '', notes)
+    }
+    if (match === null) {
+      return {
+        ok: false,
+        message: outcome.kind === 'unavailable'
+          ? `${outcome.message}。「${dictated}」有 ${String(resolution.matches.length)} 个候选，请向用户确认是哪一个再调用。`
+          : `「${dictated}」有 ${String(resolution.matches.length)} 个候选，没有选中任何一个，这次没有读取。`,
+        matches: resolution.matches.slice(0, SYMBOL_CHOICES).map(projectMatch),
+        questions: wireQuestions([question]),
+        ...notes.length === 0 ? {} : { notes },
+      }
+    }
+  } else {
+    return {
+      ok: false,
+      message: `本地代码索引里没有「${dictated}」，也无法按代码形状推断；先用 ${SEARCH_TOOL} 查一下代码。`,
+    }
+  }
+
+  const limit = clampLimit(numberOf(args['bars']), DETAIL_BARS, DETAIL_BARS_MAX)
+  const read = service.symbolBars(match.symbol, limit)
+  const state = service.state()
+  const position = state.positions.find(row => row.symbol === read.symbol)
+  const cleared = state.closed.find(row => row.symbol === read.symbol)
+  const name = match.name ?? position?.name ?? cleared?.name ?? null
+  const currency = position?.currency ?? cleared?.currency ?? match.currency
+  const stats = read.stats
+  const price = position?.price ?? stats.lastClose
+  const priceDate = position?.priceDate ?? stats.lastDate
+
+  const message = `${read.symbol}${name === null ? '' : ` ${name}`}：`
+    + (stats.barCount === 0
+      ? '本地还没有日线，等下一次行情刷新'
+      : `${String(stats.barCount)} 根日线（${stats.firstDate ?? '?'} → ${stats.lastDate ?? '?'}），`
+        + `最新收盘 ${stats.lastClose === null ? '—' : plain(stats.lastClose)} ${currency}`)
+    + (position === undefined
+      ? '；当前没有持仓'
+      : `；持仓 ${plain(position.quantity)} 股，成本 ${plain(position.avgCost)}`
+        + `${position.unrealizedPnl === null ? '' : `，浮动 ${signed(position.unrealizedPnl)}`}`
+        + `${position.marketValue === null ? '' : `，市值 ${money(position.marketValue)}`}`)
+
+  return {
+    ok: true,
+    message,
+    symbol: read.symbol,
+    exchange: match.exchange,
+    currency,
+    ...name === null ? {} : { name },
+    ...price === null || priceDate === null ? {} : { quote: { price, date: priceDate } },
+    history: projectIndicators(stats),
+    recent_bars: read.bars.slice(-RECENT_BARS).map(projectBar),
+    bars_truncated: read.bars.length >= limit,
+    ...position === undefined ? {} : { position: projectPosition(position) },
+    ...cleared === undefined ? {} : { closed: projectClosed(cleared) },
+    ...asked.length === 0 ? {} : { asked },
+    ...notes.length === 0 ? {} : { notes },
+  }
+}
+
+/**
+ * The aggregate analysis: what the trade log says about how the user trades.
+ *
+ * Every number here is already computed by `derivePortfolio` for the panel's
+ * 分析 section, so the tool adds no second arithmetic — only a projection and a
+ * bounded ranking.
+ * @param rawArgs - the model's arguments.
+ * @param service - the portfolio service.
+ * @returns the tool's canonical result value.
+ */
+function executeAnalysis(rawArgs: unknown, service: PortfolioService): Record<string, unknown> {
+  const args = asRecord(rawArgs)
+  const limit = clampLimit(numberOf(args['limit']), RANKING_LIMIT, POSITION_LIMIT)
+  const state = service.state()
+  const stats = state.stats
+  const ranking = [...state.positions]
+    .sort((left, right) => (right.unrealizedPnl ?? 0) + right.realizedPnl
+      - ((left.unrealizedPnl ?? 0) + left.realizedPnl))
+    .slice(0, limit)
+    .map(projectRanking)
+  const bestMotive = stats.byMotive.reduce<BreakdownRow | null>(
+    (best, row) => best === null || row.totalPnl > best.totalPnl ? row : best,
+    null,
+  )
+
+  const message = `已实现 ${signed(stats.totalRealizedPnl)} ${stats.baseCurrency}`
+    + `（${String(stats.closedPositions)} 次清仓、${String(stats.tradeCount)} 笔交易）`
+    + `${stats.winRate === null ? '' : `，胜率 ${(stats.winRate * 100).toFixed(1)}%`}`
+    + `${stats.profitFactor === null ? '' : `，盈亏比 ${stats.profitFactor.toFixed(2)}`}`
+    + `；按动机 ${String(stats.byMotive.length)} 组、按市场 ${String(stats.byMarket.length)} 组`
+    + `${bestMotive === null ? '' : `，「${bestMotive.label}」合计 ${signed(bestMotive.totalPnl)} 最高`}`
+
+  return {
+    ok: true,
+    message,
+    base_currency: stats.baseCurrency,
+    ratios: {
+      closed_positions: stats.closedPositions,
+      open_positions: stats.openPositions,
+      trade_count: stats.tradeCount,
+      ...stats.winRate === null ? {} : { win_rate: stats.winRate },
+      ...stats.avgWin === null ? {} : { avg_win: stats.avgWin },
+      ...stats.avgLoss === null ? {} : { avg_loss: stats.avgLoss },
+      ...stats.profitFactor === null ? {} : { profit_factor: stats.profitFactor },
+      ...stats.bestSymbol === null ? {} : { best_symbol: stats.bestSymbol },
+      ...stats.worstSymbol === null ? {} : { worst_symbol: stats.worstSymbol },
+    },
+    by_motive: stats.byMotive.map(projectBreakdown),
+    by_market: stats.byMarket.map(projectBreakdown),
+    ranking,
+    closed: state.closed.slice(0, limit).map(projectClosed),
+    rates_note: `已实现盈亏记在卖出动机上，浮动盈亏按买入动机仍占用的成本比例分摊；金额折算为 ${stats.baseCurrency}`,
+  }
+}
+
+/**
+ * Read the trade log's individual rows, after asking the user out loud.
+ *
+ * This is the one read that is gated: a row carries what the user paid, why they
+ * paid it, and whatever else they wrote down. The card is per call, because
+ * “may I look” is a question about this read, not a setting — and every way of
+ * not getting a clear yes (declined, dismissed, no answerer at all) ends in a
+ * reply with no records in it.
+ * @param rawArgs - the model's arguments.
+ * @param exec - the execution context.
+ * @param service - the portfolio service.
+ * @param deps - the tool's capabilities.
+ * @returns the tool's canonical result value.
+ */
+async function executeListTrades(
+  rawArgs: unknown,
+  exec: ToolRunContext,
+  service: PortfolioService,
+  deps: PortfolioToolDeps,
+): Promise<Record<string, unknown>> {
+  const args = asRecord(rawArgs)
+  const now = deps.now?.() ?? new Date()
+  const notes: string[] = []
+  const filter: Record<string, unknown> = {}
+
+  const symbol = textOf(args['symbol'])
+  if (symbol !== null) filter['symbol'] = symbol
+  const side = parseSide(args['side'])
+  if (side !== null) filter['side'] = side
+  else if (textOf(args['side']) !== null) notes.push(`方向「${textOf(args['side']) ?? ''}」不是买入或卖出，已忽略`)
+  const sinceRaw = textOf(args['since'])
+  const since = parseDate(args['since'], now)
+  if (since !== null) filter['since'] = since
+  else if (sinceRaw !== null) notes.push(`起始日期「${sinceRaw}」看不懂，已忽略`)
+  const untilRaw = textOf(args['until'])
+  const until = parseDate(args['until'], now)
+  if (until !== null) filter['until'] = until
+  else if (untilRaw !== null) notes.push(`结束日期「${untilRaw}」看不懂，已忽略`)
+  const limit = clampLimit(numberOf(args['limit']), TRADE_LIMIT, TRADE_LIMIT_MAX)
+
+  const question = consentQuestion(describeTradeScope(filter, limit))
+  const outcome = await askUser(deps, [question], exec)
+  const refused = (message: string, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+    ok: false,
+    consent: 'declined',
+    message,
+    ...extra,
+    ...notes.length === 0 ? {} : { notes },
+  })
+  if (outcome.kind === 'unavailable') {
+    return refused(
+      `${outcome.message}。读取交易记录必须由用户当面同意：请先用你自己的 ask_user_question 向用户说明要看什么并取得允许，再调用一次。`,
+      { questions: wireQuestions([question]) },
+    )
+  }
+  if (outcome.kind === 'aborted') {
+    return refused('授权卡片被关掉了，没有读取交易记录，也没有返回任何明细。')
+  }
+  if (!consentGranted(answerText(outcome.answers, 'consent'))) {
+    return refused('用户没有同意读取交易记录，这次没有返回任何明细。')
+  }
+
+  // Names come from the index when a trade row has none yet: the tool filters on
+  // what the user calls a symbol, and the stored row may not carry that name.
+  const all = service.db.listTrades()
+  const names = service.db.namesOf([...new Set(all.map(trade => trade.symbol))])
+  const nameOf = (trade: Trade): string | null => trade.name ?? names.get(trade.symbol) ?? null
+  const needle = symbol?.toUpperCase() ?? null
+  const canonical = canonicalSymbol(symbol)
+  const keeps = (trade: Trade): boolean => {
+    if (needle !== null) {
+      const name = nameOf(trade)
+      const hit = trade.symbol.toUpperCase().includes(needle)
+        || (name ?? '').toUpperCase().includes(needle)
+        || (canonical !== null && trade.symbol === canonical)
+      if (!hit) return false
+    }
+    if (side !== null && trade.side !== side) return false
+    if (since !== null && trade.tradedAt < since) return false
+    if (until !== null && trade.tradedAt > until) return false
+    return true
+  }
+
+  const matched = all.filter(keeps)
+  // The store lists the log chronologically; a reader wants the newest first.
+  const rows = [...matched].reverse().slice(0, limit).map(trade => {
+    const row = projectTrade(trade)
+    const name = nameOf(trade)
+    return name === null || row['name'] !== undefined ? row : { ...row, name }
+  })
+
+  return {
+    ok: true,
+    consent: 'granted',
+    message: `用户已同意；${describeTradeScope(filter, limit)}，共 ${String(matched.length)} 笔`
+      + `${matched.length > rows.length ? `，列出最近 ${String(rows.length)} 笔` : ''}`,
+    count: matched.length,
+    trades: rows,
+    truncated: matched.length > rows.length,
+    ...Object.keys(filter).length === 0 ? {} : { filter },
+    ...notes.length === 0 ? {} : { notes },
+  }
+}
+
 // ─── schemas ─────────────────────────────────────────────────────────────────
+
+/**
+ * The questions a reply hands back, as lossless JSON.
+ *
+ * Declared once because three tools can return open questions — the write path
+ * always, and the reads whenever there is nobody to ask.
+ */
+const QUESTIONS_SCHEMA: Record<string, unknown> = {
+  type: 'array',
+  description: '本来要弹给用户的问题，便于调用方自己再问一次。',
+  items: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      id: { type: 'string' },
+      question: { type: 'string' },
+      header: { type: 'string' },
+      detail: { type: 'string' },
+      multi_select: { type: 'boolean' },
+      options: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { label: { type: 'string' }, description: { type: 'string' } },
+          required: ['label'],
+        },
+      },
+    },
+    required: ['id', 'question'],
+  },
+}
+
+/** One stored trade row, as the model may read it out of a consenting call. */
+const TRADE_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    id: { type: 'number' },
+    symbol: { type: 'string' },
+    name: { type: 'string' },
+    exchange: { type: 'string' },
+    currency: { type: 'string' },
+    side: { type: 'string', enum: ['buy', 'sell'] },
+    quantity: { type: 'number' },
+    price: { type: 'number' },
+    traded_at: { type: 'string' },
+    motive: { type: 'string' },
+    note: { type: 'string' },
+  },
+  required: ['id', 'symbol', 'exchange', 'currency', 'side', 'quantity', 'price', 'traded_at'],
+}
+
+/** One cleared episode: a symbol that went to zero and what it booked. */
+const CLOSED_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    symbol: { type: 'string' },
+    name: { type: 'string' },
+    exchange: { type: 'string' },
+    currency: { type: 'string' },
+    realized_pnl: { type: 'number' },
+    cost_sold: { type: 'number' },
+    proceeds: { type: 'number' },
+    trade_count: { type: 'number' },
+    opened_at: { type: 'string' },
+    closed_at: { type: 'string' },
+  },
+  required: [
+    'symbol', 'exchange', 'currency', 'realized_pnl', 'cost_sold', 'proceeds',
+    'trade_count', 'opened_at', 'closed_at',
+  ],
+}
+
+/** One index hit; the shape the search tool and a symbol question both speak. */
+const MATCH_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    symbol: { type: 'string' },
+    name: { type: 'string' },
+    exchange: { type: 'string' },
+    currency: { type: 'string' },
+    type: { type: 'string' },
+  },
+  required: ['symbol', 'exchange', 'currency'],
+}
+
+/** One grouped breakdown row, by motive or by market. */
+const BREAKDOWN_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    key: { type: 'string' },
+    label: { type: 'string' },
+    trades: { type: 'number' },
+    realized_pnl: { type: 'number' },
+    unrealized_pnl: { type: 'number' },
+    total_pnl: { type: 'number' },
+    market_value: { type: 'number' },
+  },
+  required: [
+    'key', 'label', 'trades', 'realized_pnl', 'unrealized_pnl', 'total_pnl', 'market_value',
+  ],
+}
+
+/** One ranking row: what a position booked, and what it is still worth. */
+const RANKING_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    symbol: { type: 'string' },
+    name: { type: 'string' },
+    currency: { type: 'string' },
+    trade_count: { type: 'number' },
+    realized_pnl: { type: 'number' },
+    unrealized_pnl: { type: 'number' },
+    total_pnl: { type: 'number' },
+    market_value: { type: 'number' },
+    weight: { type: 'number' },
+  },
+  required: ['symbol', 'currency', 'trade_count', 'realized_pnl', 'total_pnl', 'weight'],
+}
+
+/** One daily bar; the series the model is shown is a tail of these. */
+const BAR_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    date: { type: 'string' },
+    close: { type: 'number' },
+    high: { type: 'number' },
+    low: { type: 'number' },
+    volume: { type: 'number' },
+  },
+  required: ['date', 'close', 'high', 'low', 'volume'],
+}
+
+/**
+ * The indicators measured from one stored series.
+ *
+ * `bar_count` and `streak` are always there — zero bars is an answer — while
+ * every window that the series is too short for is simply absent, so the model
+ * can tell “no number” from “zero”.
+ */
+const HISTORY_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    bar_count: { type: 'number' },
+    streak: { type: 'number' },
+    first_date: { type: 'string' },
+    last_date: { type: 'string' },
+    last_close: { type: 'number' },
+    returns: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          days: { type: 'number' },
+          change: { type: 'number' },
+          pct: { type: 'number' },
+        },
+        required: ['days'],
+      },
+    },
+    ma20: { type: 'number' },
+    ma20_gap: { type: 'number' },
+    volatility20: { type: 'number' },
+    volume_ratio: { type: 'number' },
+    max_drawdown60: { type: 'number' },
+    range_position60: { type: 'number' },
+    high60: { type: 'number' },
+    low60: { type: 'number' },
+  },
+  required: ['bar_count', 'streak', 'returns'],
+}
 
 /**
  * One position row, declared once and referenced by both tools.
@@ -971,24 +1702,7 @@ const OUTPUT_SCHEMA: Record<string, unknown> = {
   properties: {
     ok: { type: 'boolean', description: 'true 表示交易已经写入；false 表示没有写入，看 missing / questions。' },
     message: { type: 'string', description: '给用户看的一句话结论。' },
-    trade: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        id: { type: 'number' },
-        symbol: { type: 'string' },
-        name: { type: 'string' },
-        exchange: { type: 'string' },
-        currency: { type: 'string' },
-        side: { type: 'string', enum: ['buy', 'sell'] },
-        quantity: { type: 'number' },
-        price: { type: 'number' },
-        traded_at: { type: 'string' },
-        motive: { type: 'string' },
-        note: { type: 'string' },
-      },
-      required: ['id', 'symbol', 'exchange', 'currency', 'side', 'quantity', 'price', 'traded_at'],
-    },
+    trade: TRADE_SCHEMA,
     position: POSITION_SCHEMA,
     asked: { type: 'array', items: { type: 'string' }, description: '这次向用户提了哪些字段的问题。' },
     notes: { type: 'array', items: { type: 'string' }, description: '推断与降级说明，例如代码按形状推断。' },
@@ -998,31 +1712,7 @@ const OUTPUT_SCHEMA: Record<string, unknown> = {
       description: '仍然缺失、导致没有写入的字段名。',
     },
     missing_labels: { type: 'array', items: { type: 'string' }, description: '上面那些字段的中文名。' },
-    questions: {
-      type: 'array',
-      description: '本来要弹给用户的问题，便于调用方自己再问一次。',
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          id: { type: 'string' },
-          question: { type: 'string' },
-          header: { type: 'string' },
-          detail: { type: 'string' },
-          multi_select: { type: 'boolean' },
-          options: {
-            type: 'array',
-            items: {
-              type: 'object',
-              additionalProperties: false,
-              properties: { label: { type: 'string' }, description: { type: 'string' } },
-              required: ['label'],
-            },
-          },
-        },
-        required: ['id', 'question'],
-      },
-    },
+    questions: QUESTIONS_SCHEMA,
     base_currency: { type: 'string' },
     totals: {
       type: 'object',
@@ -1064,33 +1754,125 @@ const OUTPUT_SCHEMA: Record<string, unknown> = {
     },
     positions: { type: 'array', items: POSITION_SCHEMA },
     positions_truncated: { type: 'boolean' },
-    closed: {
-      type: 'array',
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          symbol: { type: 'string' },
-          name: { type: 'string' },
-          exchange: { type: 'string' },
-          currency: { type: 'string' },
-          realized_pnl: { type: 'number' },
-          cost_sold: { type: 'number' },
-          proceeds: { type: 'number' },
-          trade_count: { type: 'number' },
-          opened_at: { type: 'string' },
-          closed_at: { type: 'string' },
-        },
-        required: [
-          'symbol', 'exchange', 'currency', 'realized_pnl', 'cost_sold', 'proceeds',
-          'trade_count', 'opened_at', 'closed_at',
-        ],
-      },
-    },
+    closed: { type: 'array', items: CLOSED_SCHEMA },
     filter: { type: 'string' },
     rates_note: { type: 'string' },
   },
   required: ['ok', 'message'],
+}
+
+/** The search tool's result: index hits, or an honest empty list. */
+const SEARCH_OUTPUT_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    ok: { type: 'boolean', description: 'true 表示索引里有命中。' },
+    message: { type: 'string' },
+    query: { type: 'string' },
+    matches: { type: 'array', items: MATCH_SCHEMA },
+    truncated: { type: 'boolean' },
+  },
+  required: ['ok', 'message'],
+}
+
+/** The symbol-detail result: the series, its indicators, and the holding. */
+const DETAIL_OUTPUT_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    ok: { type: 'boolean', description: 'true 表示读到了本地数据；false 表示标的没定下来。' },
+    message: { type: 'string' },
+    symbol: { type: 'string' },
+    name: { type: 'string' },
+    exchange: { type: 'string' },
+    currency: { type: 'string' },
+    quote: {
+      type: 'object',
+      additionalProperties: false,
+      properties: { price: { type: 'number' }, date: { type: 'string' } },
+      required: ['price', 'date'],
+    },
+    history: HISTORY_SCHEMA,
+    recent_bars: { type: 'array', items: BAR_SCHEMA },
+    bars_truncated: { type: 'boolean' },
+    position: POSITION_SCHEMA,
+    closed: CLOSED_SCHEMA,
+    matches: { type: 'array', items: MATCH_SCHEMA },
+    questions: QUESTIONS_SCHEMA,
+    asked: { type: 'array', items: { type: 'string' } },
+    notes: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['ok', 'message'],
+}
+
+/** The analysis result: ratios, two breakdowns, a ranking and the closed list. */
+const ANALYSIS_OUTPUT_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    ok: { type: 'boolean' },
+    message: { type: 'string' },
+    base_currency: { type: 'string' },
+    ratios: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        closed_positions: { type: 'number' },
+        open_positions: { type: 'number' },
+        trade_count: { type: 'number' },
+        win_rate: { type: 'number' },
+        avg_win: { type: 'number' },
+        avg_loss: { type: 'number' },
+        profit_factor: { type: 'number' },
+        best_symbol: { type: 'string' },
+        worst_symbol: { type: 'string' },
+      },
+      required: ['closed_positions', 'open_positions', 'trade_count'],
+    },
+    by_motive: { type: 'array', items: BREAKDOWN_SCHEMA },
+    by_market: { type: 'array', items: BREAKDOWN_SCHEMA },
+    ranking: { type: 'array', items: RANKING_SCHEMA },
+    closed: { type: 'array', items: CLOSED_SCHEMA },
+    rates_note: { type: 'string' },
+  },
+  required: ['ok', 'message'],
+}
+
+/**
+ * The consent-gated trade read.
+ *
+ * `consent` is required in every outcome — including the failures — so a caller
+ * can never mistake “nobody agreed” for “there are no trades”.
+ */
+const TRADES_OUTPUT_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    ok: { type: 'boolean', description: 'true 表示用户同意且明细已返回；false 表示没有读取。' },
+    message: { type: 'string' },
+    consent: {
+      type: 'string',
+      enum: ['granted', 'declined'],
+      description: 'granted = 用户这次同意了；declined = 拒绝、关掉了卡片或没人可问。',
+    },
+    count: { type: 'number', description: '符合筛选条件的交易笔数（不等于返回的条数）。' },
+    trades: { type: 'array', items: TRADE_SCHEMA },
+    truncated: { type: 'boolean' },
+    filter: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        symbol: { type: 'string' },
+        side: { type: 'string', enum: ['buy', 'sell'] },
+        since: { type: 'string' },
+        until: { type: 'string' },
+      },
+      required: [],
+    },
+    questions: QUESTIONS_SCHEMA,
+    notes: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['ok', 'message', 'consent'],
 }
 
 /** The tool that records a trade. */
@@ -1155,6 +1937,123 @@ function overviewTool(service: PortfolioService): ToolDefinition {
   }
 }
 
+/** The tool that reads one symbol's stored series and its holding. */
+function symbolDetailTool(service: PortfolioService, deps: PortfolioToolDeps): ToolDefinition {
+  return {
+    name: SYMBOL_DETAIL_TOOL,
+    description: DESCRIPTION_SYMBOL_DETAIL,
+    parameters: {
+      type: 'object',
+      properties: {
+        symbol: {
+          type: 'string',
+          description: '标的代码或名称：600000.SH / 00700.HK / AAPL / 腾讯控股。有歧义时会弹卡片让用户挑。',
+        },
+        bars: {
+          type: 'number',
+          description: `返回多少根日线，默认 ${String(DETAIL_BARS)}，最多 ${String(DETAIL_BARS_MAX)}；各窗口指标按自己的长度算，与它无关。`,
+        },
+      },
+      required: ['symbol'],
+    },
+    output: { schema: DETAIL_OUTPUT_SCHEMA, render: renderSymbolDetail },
+    execute(args: unknown, exec: ToolRunContext): Promise<unknown> {
+      return executeSymbolDetail(args, exec, service, deps)
+    },
+    presentCall(args: unknown): ToolCallView | undefined {
+      try {
+        const symbol = textOf(asRecord(args)['symbol'])
+        return { card: 'generic', title: `读取 ${symbol ?? '标的'}` }
+      } catch {
+        return undefined
+      }
+    },
+  }
+}
+
+/** The tool that reports the aggregate analysis. */
+function analysisTool(service: PortfolioService): ToolDefinition {
+  return {
+    name: ANALYSIS_TOOL,
+    description: DESCRIPTION_ANALYSIS,
+    parameters: {
+      type: 'object',
+      properties: {
+        limit: {
+          type: 'number',
+          description: `排行与清仓历史各返回多少行，默认 ${String(RANKING_LIMIT)}，最多 ${String(POSITION_LIMIT)}。`,
+        },
+      },
+    },
+    output: { schema: ANALYSIS_OUTPUT_SCHEMA, render: renderAnalysis },
+    execute(args: unknown): Promise<unknown> {
+      return Promise.resolve(executeAnalysis(args, service))
+    },
+    presentCall(): ToolCallView {
+      return { card: 'generic', title: '分析持仓' }
+    },
+  }
+}
+
+/** The tool that searches the local instrument index. */
+function searchTool(service: PortfolioService): ToolDefinition {
+  return {
+    name: SEARCH_TOOL,
+    description: DESCRIPTION_SEARCH,
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '代码或名称片段：600000 / 00700.HK / AAPL / 腾讯 / 平安。' },
+        limit: {
+          type: 'number',
+          description: `最多返回多少条，默认 ${String(SEARCH_LIMIT)}，最多 ${String(SEARCH_LIMIT_MAX)}。`,
+        },
+      },
+      required: ['query'],
+    },
+    output: { schema: SEARCH_OUTPUT_SCHEMA, render: renderSearch },
+    execute(args: unknown): Promise<unknown> {
+      return executeSearch(args, service)
+    },
+    presentCall(args: unknown): ToolCallView | undefined {
+      try {
+        const query = textOf(asRecord(args)['query'])
+        return { card: 'generic', title: `检索 ${query ?? '标的'}` }
+      } catch {
+        return undefined
+      }
+    },
+  }
+}
+
+/** The consent-gated tool that reads the trade log's rows. */
+function listTradesTool(service: PortfolioService, deps: PortfolioToolDeps): ToolDefinition {
+  return {
+    name: LIST_TRADES_TOOL,
+    description: DESCRIPTION_LIST_TRADES,
+    parameters: {
+      type: 'object',
+      properties: {
+        symbol: { type: 'string', description: '只看这一个标的（代码或名称片段）；不传就是全部。' },
+        side: { type: 'string', enum: ['buy', 'sell'], description: '只看买入或只看卖出；不传就是两边都要。' },
+        since: { type: 'string', description: '起始成交日期 YYYY-MM-DD；「今天」「昨天」也可以。' },
+        until: { type: 'string', description: '结束成交日期 YYYY-MM-DD。' },
+        limit: {
+          type: 'number',
+          description: `最多返回多少笔（最近的优先），默认 ${String(TRADE_LIMIT)}，最多 ${String(TRADE_LIMIT_MAX)}。`,
+        },
+      },
+    },
+    output: { schema: TRADES_OUTPUT_SCHEMA, render: renderTrades },
+    execute(args: unknown, exec: ToolRunContext): Promise<unknown> {
+      return executeListTrades(args, exec, service, deps)
+    },
+    presentCall(): ToolCallView {
+      return { card: 'generic', title: '读取交易记录' }
+    },
+  }
+}
+
 /**
  * What the model reads as the tool result.
  *
@@ -1182,27 +2081,152 @@ function renderResult(_args: unknown, value: unknown): readonly TextBlock[] {
       + ` · 已实现 ${signed(numberValue(row['realized_pnl']))}`)
   }
   for (const cleared of Array.isArray(result['closed']) ? result['closed'] : []) {
-    const row = asRecord(cleared)
-    lines.push(`（已清仓）${textOf(row['symbol']) ?? ''} ${textOf(row['name']) ?? ''}：`
-      + `${textOf(row['opened_at']) ?? ''} → ${textOf(row['closed_at']) ?? ''}`
-      + ` · 已实现 ${signed(numberValue(row['realized_pnl']))} ${textOf(row['currency']) ?? ''}`)
+    lines.push(closedLine(asRecord(cleared)))
   }
   if (result['positions_truncated'] === true) lines.push('（持仓行多于这里列出的数量，已截断）')
 
   for (const note of stringList(result['notes'])) lines.push(`· ${note}`)
-  const questions = Array.isArray(result['questions']) ? result['questions'] : []
-  if (questions.length > 0) {
-    lines.push('需要向用户确认：')
-    for (const entry of questions) {
-      const question = asRecord(entry)
-      const labels = (Array.isArray(question['options']) ? question['options'] : [])
-        .map(option => textOf(asRecord(option)['label']))
-        .filter((label): label is string => label !== null)
-      lines.push(`- [${textOf(question['id']) ?? ''}] ${textOf(question['question']) ?? ''}`
-        + `${labels.length === 0 ? '' : ` 选项：${labels.join(' / ')}`}`)
+  lines.push(...questionLines(result))
+  return [{ type: 'text', text: lines.join('\n') }]
+}
+
+/**
+ * What the model reads as one symbol's read result.
+ *
+ * Same contract as {@link renderResult}: the series and the indicator block have
+ * to be spelled out here, because this projection is the model's entire view.
+ */
+function renderSymbolDetail(_args: unknown, value: unknown): readonly TextBlock[] {
+  const result = asRecord(value)
+  const lines: string[] = []
+  const message = textOf(result['message'])
+  if (message !== null) lines.push(message)
+
+  const position = asRecord(result['position'])
+  if (Object.keys(position).length > 0) lines.push(positionLine(position))
+  for (const cleared of Array.isArray(result['closed']) ? result['closed'] : []) {
+    lines.push(closedLine(asRecord(cleared)))
+  }
+  const history = asRecord(result['history'])
+  if (Object.keys(history).length > 0) {
+    const summary = historyLine(history)
+    if (summary !== '') lines.push(summary)
+  }
+  const bars = Array.isArray(result['recent_bars']) ? result['recent_bars'] : []
+  if (bars.length > 0) {
+    const tail = bars.map(entry => {
+      const bar = asRecord(entry)
+      return `${(textOf(bar['date']) ?? '').slice(5)} ${plain(numberValue(bar['close']))}`
+    })
+    lines.push(`最近 ${String(bars.length)} 个交易日收盘：${tail.join(' · ')}`)
+  }
+  if (result['bars_truncated'] === true) lines.push('（可能还有更早的日线，需要更长窗口就把 bars 调大）')
+  for (const row of Array.isArray(result['matches']) ? result['matches'] : []) {
+    lines.push(matchLine(asRecord(row)))
+  }
+  for (const note of stringList(result['notes'])) lines.push(`· ${note}`)
+  lines.push(...questionLines(result))
+  return [{ type: 'text', text: lines.join('\n') }]
+}
+
+/** What the model reads as the aggregate analysis. */
+function renderAnalysis(_args: unknown, value: unknown): readonly TextBlock[] {
+  const result = asRecord(value)
+  const lines: string[] = []
+  const message = textOf(result['message'])
+  if (message !== null) lines.push(message)
+
+  const ratios = asRecord(result['ratios'])
+  const extras: string[] = []
+  if (typeof ratios['avg_win'] === 'number') extras.push(`平均盈利 ${money(ratios['avg_win'])}`)
+  if (typeof ratios['avg_loss'] === 'number') extras.push(`平均亏损 ${money(ratios['avg_loss'])}`)
+  if (typeof ratios['profit_factor'] === 'number') extras.push(`盈亏比 ${ratios['profit_factor'].toFixed(2)}`)
+  if (typeof ratios['best_symbol'] === 'string') extras.push(`最好 ${ratios['best_symbol']}`)
+  if (typeof ratios['worst_symbol'] === 'string') extras.push(`最差 ${ratios['worst_symbol']}`)
+  if (extras.length > 0) lines.push(extras.join(' · '))
+
+  const sections: readonly [string, string][] = [
+    ['by_motive', '按动机（已实现记在卖出动机，浮动按买入动机的成本占比分摊）'],
+    ['by_market', '按市场'],
+  ]
+  for (const [key, title] of sections) {
+    const rows = Array.isArray(result[key]) ? result[key] : []
+    if (rows.length === 0) continue
+    lines.push(`${title}：`)
+    for (const entry of rows) lines.push(`- ${breakdownLine(asRecord(entry))}`)
+  }
+  const ranking = Array.isArray(result['ranking']) ? result['ranking'] : []
+  if (ranking.length > 0) {
+    lines.push('标的表现排行（合计 = 已实现 + 浮动）：')
+    for (const entry of ranking) {
+      const row = asRecord(entry)
+      const name = textOf(row['name'])
+      const weight = typeof row['weight'] === 'number' ? ` · 仓位 ${(row['weight'] * 100).toFixed(1)}%` : ''
+      lines.push(`- ${textOf(row['symbol']) ?? ''}${name === null ? '' : ` ${name}`}`
+        + `：已实现 ${signed(numberValue(row['realized_pnl']))}`
+        + `${typeof row['unrealized_pnl'] === 'number' ? ` · 浮动 ${signed(row['unrealized_pnl'])}` : ''}`
+        + ` · 合计 ${signed(numberValue(row['total_pnl']))}${weight}`)
     }
   }
+  for (const cleared of Array.isArray(result['closed']) ? result['closed'] : []) {
+    lines.push(closedLine(asRecord(cleared)))
+  }
+  const ratesNote = textOf(result['rates_note'])
+  if (ratesNote !== null) lines.push(`· ${ratesNote}`)
   return [{ type: 'text', text: lines.join('\n') }]
+}
+
+/** What the model reads as an index search. */
+function renderSearch(_args: unknown, value: unknown): readonly TextBlock[] {
+  const result = asRecord(value)
+  const lines: string[] = []
+  const message = textOf(result['message'])
+  if (message !== null) lines.push(message)
+  for (const row of Array.isArray(result['matches']) ? result['matches'] : []) {
+    lines.push(matchLine(asRecord(row)))
+  }
+  if (result['truncated'] === true) lines.push('（命中多于这里列出的数量，已截断）')
+  return [{ type: 'text', text: lines.join('\n') }]
+}
+
+/** What the model reads as a trade-log read, consent or no consent. */
+function renderTrades(_args: unknown, value: unknown): readonly TextBlock[] {
+  const result = asRecord(value)
+  const lines: string[] = []
+  const message = textOf(result['message'])
+  if (message !== null) lines.push(message)
+  for (const entry of Array.isArray(result['trades']) ? result['trades'] : []) {
+    const row = asRecord(entry)
+    const name = textOf(row['name'])
+    const motive = textOf(row['motive'])
+    const note = textOf(row['note'])
+    lines.push(`#${plain(numberValue(row['id']))} ${textOf(row['traded_at']) ?? ''} `
+      + `${row['side'] === 'sell' ? '卖出' : '买入'} ${textOf(row['symbol']) ?? ''}`
+      + `${name === null ? '' : ` ${name}`} ${plain(numberValue(row['quantity']))} @ `
+      + `${plain(numberValue(row['price']))} ${textOf(row['currency']) ?? ''}`
+      + `${motive === null ? '' : `（动机：${motive}）`}${note === null ? '' : ` · ${note}`}`)
+  }
+  if (result['truncated'] === true) lines.push('（交易记录多于这里列出的数量，已截断）')
+  for (const note of stringList(result['notes'])) lines.push(`· ${note}`)
+  lines.push(...questionLines(result))
+  return [{ type: 'text', text: lines.join('\n') }]
+}
+
+/** The open questions restated for the calling model, if there are any. */
+function questionLines(result: Record<string, unknown>): string[] {
+  const lines: string[] = []
+  const questions = Array.isArray(result['questions']) ? result['questions'] : []
+  if (questions.length === 0) return lines
+  lines.push('需要向用户确认：')
+  for (const entry of questions) {
+    const question = asRecord(entry)
+    const labels = (Array.isArray(question['options']) ? question['options'] : [])
+      .map(option => textOf(asRecord(option)['label']))
+      .filter((label): label is string => label !== null)
+    lines.push(`- [${textOf(question['id']) ?? ''}] ${textOf(question['question']) ?? ''}`
+      + `${labels.length === 0 ? '' : ` 选项：${labels.join(' / ')}`}`)
+  }
+  return lines
 }
 
 /** A number from one projected record, or `0` when it is absent. */
@@ -1228,11 +2252,75 @@ function positionLine(row: Record<string, unknown>): string {
     + `${unrealized === null ? '' : ` · 浮动 ${signed(unrealized)}${ratio === null ? '' : `（${percent(ratio)}）`}`}`
 }
 
+/** One cleared episode as a line of the model's view. */
+function closedLine(row: Record<string, unknown>): string {
+  return `（已清仓）${textOf(row['symbol']) ?? ''} ${textOf(row['name']) ?? ''}：`
+    + `${textOf(row['opened_at']) ?? ''} → ${textOf(row['closed_at']) ?? ''}`
+    + ` · 已实现 ${signed(numberValue(row['realized_pnl']))} ${textOf(row['currency']) ?? ''}`
+}
+
+/** One index hit as a line of the model's view. */
+function matchLine(row: Record<string, unknown>): string {
+  const name = textOf(row['name'])
+  const type = textOf(row['type'])
+  return `- ${textOf(row['symbol']) ?? ''}${name === null ? '' : ` ${name}`}`
+    + ` · ${textOf(row['exchange']) ?? ''} · ${textOf(row['currency']) ?? ''}`
+    + `${type === null ? '' : ` · ${type}`}`
+}
+
+/** One grouped breakdown row as a line of the model's view. */
+function breakdownLine(row: Record<string, unknown>): string {
+  return `${textOf(row['label']) ?? ''}：${plain(numberValue(row['trades']))} 笔`
+    + ` · 已实现 ${signed(numberValue(row['realized_pnl']))}`
+    + ` · 浮动 ${signed(numberValue(row['unrealized_pnl']))}`
+    + ` · 合计 ${signed(numberValue(row['total_pnl']))}`
+    + ` · 市值 ${money(numberValue(row['market_value']))}`
+}
+
+/**
+ * The indicator block as one line.
+ *
+ * Every window is independent: a short series answers what it can and leaves the
+ * rest out, and this line simply does not mention what is not there.
+ */
+function historyLine(history: Record<string, unknown>): string {
+  const parts: string[] = []
+  const windows = (Array.isArray(history['returns']) ? history['returns'] : []).map(entry => {
+    const period = asRecord(entry)
+    const pct = typeof period['pct'] === 'number' ? period['pct'] : null
+    return `${plain(numberValue(period['days']))} 日 ${pct === null ? '—' : percent(pct)}`
+  })
+  if (windows.length > 0) parts.push(windows.join(' / '))
+
+  const ma20 = typeof history['ma20'] === 'number' ? history['ma20'] : null
+  const gap = typeof history['ma20_gap'] === 'number' ? history['ma20_gap'] : null
+  if (ma20 !== null) parts.push(`20 日均线 ${plain(ma20)}${gap === null ? '' : `（偏离 ${percent(gap)}）`}`)
+  const volatility = typeof history['volatility20'] === 'number' ? history['volatility20'] : null
+  if (volatility !== null) parts.push(`20 日波动率 ${(volatility * 100).toFixed(2)}%`)
+  const volumeRatio = typeof history['volume_ratio'] === 'number' ? history['volume_ratio'] : null
+  if (volumeRatio !== null) parts.push(`量比 ${volumeRatio.toFixed(2)}`)
+  const drawdown = typeof history['max_drawdown60'] === 'number' ? history['max_drawdown60'] : null
+  if (drawdown !== null) parts.push(`60 日最大回撤 ${(drawdown * 100).toFixed(2)}%`)
+  const high = typeof history['high60'] === 'number' ? history['high60'] : null
+  const low = typeof history['low60'] === 'number' ? history['low60'] : null
+  const where = typeof history['range_position60'] === 'number' ? history['range_position60'] : null
+  if (high !== null && low !== null) {
+    parts.push(`60 日区间 ${plain(low)}—${plain(high)}`
+      + `${where === null ? '' : `（位置 ${(where * 100).toFixed(0)}%）`}`)
+  }
+  const streak = typeof history['streak'] === 'number' ? history['streak'] : 0
+  if (streak > 0) parts.push(`连涨 ${String(streak)} 天`)
+  if (streak < 0) parts.push(`连跌 ${String(-streak)} 天`)
+  return parts.join(' · ')
+}
+
 /**
  * Build the tools this plugin contributes to the chat.
  *
  * Returned rather than registered so a test can drive `execute` directly, and so
- * the composition step stays a two-line decision.
+ * the composition step stays a two-line decision. The order is the order the
+ * model sees them in: the two that write and summarize, then the three reads
+ * that need no permission, then the one read that does.
  * @param service - the portfolio service.
  * @param deps - the tool's capabilities.
  * @returns the registry-ready definitions, in a stable order.
@@ -1241,7 +2329,14 @@ export function createPortfolioTools(
   service: PortfolioService,
   deps: PortfolioToolDeps = {},
 ): readonly ToolDefinition[] {
-  return [addTradeTool(service, deps), overviewTool(service)]
+  return [
+    addTradeTool(service, deps),
+    overviewTool(service),
+    symbolDetailTool(service, deps),
+    analysisTool(service),
+    searchTool(service),
+    listTradesTool(service, deps),
+  ]
 }
 
 /**
