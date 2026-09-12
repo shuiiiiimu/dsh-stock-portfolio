@@ -710,6 +710,37 @@ export class PortfolioDatabase {
   }
 
   /**
+   * Read several symbols' trailing daily bars in one statement.
+   *
+   * The review read model measures every holding over the same window, so
+   * asking per symbol would be one prepared-statement loop per open position.
+   * A window function ranks each symbol's rows newest-first and keeps its tail,
+   * which SQLite answers from the primary key without a sort per symbol.
+   * @param symbols - canonical symbols.
+   * @param limit - how many trailing bars per symbol.
+   * @returns ascending bars keyed by symbol; a symbol with no bars maps to `[]`.
+   */
+  readBarsFor(symbols: readonly string[], limit: number): Map<string, SymbolBar[]> {
+    const series = new Map<string, SymbolBar[]>()
+    if (symbols.length === 0) return series
+    const marks = symbols.map(() => '?').join(', ')
+    const rows = this.db.prepare(
+      `SELECT symbol, date, high, low, close, volume FROM (
+         SELECT symbol, date, high, low, close, volume,
+                ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date DESC) AS rank
+           FROM prices WHERE symbol IN (${marks})
+       ) WHERE rank <= ? ORDER BY symbol ASC, date ASC`,
+    ).all(...symbols, Math.max(1, Math.floor(limit))) as unknown as (SymbolBar & { symbol: string })[]
+    for (const symbol of symbols) series.set(symbol, [])
+    for (const row of rows) {
+      const bars = series.get(row.symbol)
+      if (bars === undefined) continue
+      bars.push({ date: row.date, high: row.high, low: row.low, close: row.close, volume: row.volume })
+    }
+    return series
+  }
+
+  /**
    * The newest trading date held for any symbol.
    * @returns `YYYY-MM-DD`, or `null` when no price has been fetched.
    */

@@ -252,7 +252,7 @@ export function apply(ctx: Context, rawConfig?: unknown): void {
 export { PortfolioService } from './service.ts'
 export type { PortfolioServiceOptions } from './service.ts'
 export {
-  ADD_TRADE_TOOL, ANALYSIS_TOOL, LIST_TRADES_TOOL, OVERVIEW_TOOL, SEARCH_TOOL, SYMBOL_DETAIL_TOOL,
+  ADD_TRADE_TOOL, ANALYSIS_TOOL, LIST_TRADES_TOOL, OVERVIEW_TOOL, REVIEW_TOOL, SEARCH_TOOL, SYMBOL_DETAIL_TOOL,
   createPortfolioTools, registerPortfolioTools,
 } from './tool.ts'
 export type {

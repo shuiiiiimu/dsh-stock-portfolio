@@ -446,6 +446,151 @@ export interface PortfolioState {
   readonly generatedAt: string
 }
 
+/**
+ * One holding as a portfolio review reads it.
+ *
+ * The dashboard's {@link Position} is enough to draw a row but not enough to
+ * judge one: a review has to weigh the position against the portfolio and
+ * against its own recent behaviour, so each row carries its converted market
+ * value, its weight in the same base currency the totals use, and the
+ * indicators measured off its stored series.
+ *
+ * `bars` is the measured window, not the whole series: 20 is the shortest
+ * window every indicator above needs, so a shorter series answers `null`
+ * everywhere instead of with a number measured over fewer bars.
+ */
+export interface ReviewRow {
+  readonly symbol: string
+  readonly name: string | null
+  readonly exchange: Exchange
+  readonly currency: Currency
+  readonly quantity: number
+  readonly avgCost: number
+  readonly price: number | null
+  readonly priceDate: string | null
+  /** `quantity * price`, in the symbol's own currency. */
+  readonly marketValueNative: number | null
+  /** The same value converted to the portfolio's base currency; `null` without a price. */
+  readonly marketValueBase: number | null
+  /** Share of the converted portfolio; 0 when nothing has a price. */
+  readonly weight: number
+  /** Cost basis, converted to the base currency. */
+  readonly costBase: number
+  readonly unrealizedPnl: number | null
+  readonly unrealizedPct: number | null
+  readonly dayPnlPct: number | null
+  readonly holdingDays: number | null
+  readonly tradeCount: number
+  /** Latest close against the close 30 bars back, as a ratio; `null` without that much history. */
+  readonly return30Pct: number | null
+  readonly volatility20: number | null
+  readonly maxDrawdown60: number | null
+  /** Where the latest close sits in the last 60 bars: 0 at the low, 1 at the high. */
+  readonly rangePosition60: number | null
+  readonly ma20Gap: number | null
+  /** Consecutive up (+) or down (−) closes. */
+  readonly streak: number
+  /** How many daily bars the review measured this symbol over. */
+  readonly bars: number
+  /** Whole days behind the latest close; `null` when the symbol has no bar. */
+  readonly priceAgeDays: number | null
+}
+
+/** One currency's own, unconverted subtotals as a review reads them. */
+export interface ReviewNativeTotal {
+  readonly currency: Currency
+  readonly marketValue: number
+  readonly cost: number
+  /** `marketValue - cost`, computed inside the currency rather than summed from conversions. */
+  readonly unrealizedPnl: number
+  readonly weight: number
+}
+
+/**
+ * The findings a review leads with.
+ *
+ * Every entry is computed here rather than left for the caller to notice: they
+ * are the sentences "how is my portfolio doing" is actually asking for, and a
+ * threshold applied in one place is one place to correct.
+ */
+export interface ReviewSignals {
+  /** The largest single position as a share of the portfolio. */
+  readonly concentration: number
+  readonly concentrationSymbol: string | null
+  readonly concentrationLabel: 'low' | 'moderate' | 'high'
+  /** The three largest positions' combined share. */
+  readonly topThree: number
+  readonly winners: number
+  readonly losers: number
+  readonly flat: number
+  /** Cost share of positions priced by a bar older than the staleness window. */
+  readonly staleShare: number
+  /** How many open positions the latest bar could not price at all. */
+  readonly unpriced: number
+  /** The largest position by converted market value, or `null` when nothing is priced. */
+  readonly biggestSymbol: string | null
+  readonly mostVolatileSymbol: string | null
+  readonly mostVolatile: number | null
+  readonly deepestDrawdownSymbol: string | null
+  readonly deepestDrawdown: number | null
+}
+
+/** One motive's realized and floating P&L, compacted for a review. */
+export interface ReviewMotive {
+  readonly label: string
+  readonly realizedPnl: number
+  readonly unrealizedPnl: number
+  readonly totalPnl: number
+  readonly trades: number
+}
+
+/**
+ * Everything a portfolio review states about the portfolio as it stands now.
+ *
+ * Local and computed: this carries no news, no analyst view and no forecast, so
+ * it is reproducible, costs no provider quota and is available offline. The
+ * forward-looking half of a review is a research task, not a stored fact.
+ */
+export interface PortfolioReviewSnapshot {
+  readonly generatedAt: string
+  readonly baseCurrency: Currency
+  /** The trading date of the newest stored bar across the portfolio. */
+  readonly priceDate: string | null
+  readonly totals: {
+    readonly marketValue: number
+    readonly cost: number
+    readonly unrealizedPnl: number
+    readonly unrealizedPct: number | null
+    readonly realizedPnl: number
+    readonly totalPnl: number
+    readonly dayPnl: number | null
+    readonly dayPnlPct: number | null
+    readonly openPositions: number
+    readonly closedPositions: number
+    readonly tradeCount: number
+    readonly winRate: number | null
+    readonly profitFactor: number | null
+  }
+  readonly native: readonly ReviewNativeTotal[]
+  readonly rows: readonly ReviewRow[]
+  /**
+   * The portfolio's mark-to-market move over the last ~20 calendar points of the
+   * equity curve, as a ratio; `null` without enough history. A path over the
+   * current quantities, not a money-weighted return.
+   */
+  readonly windowReturnPct: number | null
+  /** Positions carrying a floating gain, sorted by contribution. */
+  readonly topGainers: readonly ReviewRow[]
+  /** Positions carrying a floating loss, most negative first. */
+  readonly topLosers: readonly ReviewRow[]
+  readonly byMarket: readonly BreakdownRow[]
+  readonly byMotive: readonly ReviewMotive[]
+  readonly signals: ReviewSignals
+  /** Pre-rendered findings, in the order a review should state them. */
+  readonly notes: readonly string[]
+  readonly caveats: readonly string[]
+}
+
 /** An error the HTTP layer turns into a `4xx` with a user-facing message. */
 export class PortfolioError extends Error {
   readonly status: number

@@ -17,21 +17,22 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
-import { PortfolioDatabase, databasePath, displayPath } from './db.ts'
+import { PortfolioDatabase, databasePath, displayPath, STALE_AFTER_DAYS } from './db.ts'
 import type { StoredSettings } from './db.ts'
 import { acquireRates } from './fx.ts'
 import type { FxAcquisition, FxRateSource, WebCapability } from './fx.ts'
 import { computeSymbolStats } from './indicators.ts'
 import { createMentionMatcher } from './mentions.ts'
 import type { MentionMatch, MentionTarget } from './mentions.ts'
-import { buildEquityCurve, derivePortfolio, foldLedgers, rateTable, sortTrades } from './portfolio.ts'
+import { buildEquityCurve, convert, derivePortfolio, foldLedgers, rateTable, sortTrades } from './portfolio.ts'
 import type { Rates } from './portfolio.ts'
 import { codeOfSymbol, currencyOfSymbol, exchangeOfSymbol, normalizeSymbol } from './symbols.ts'
 import { TickFlowClient, TickFlowError } from './tickflow.ts'
 import { PortfolioError } from './types.ts'
 import type {
-  ApiKeySource, Currency, EquityPoint, FxRefreshResult, FxStatus, Instrument, MentionFeed, PortfolioSettings,
-  PortfolioState, QuoteFeedStatus, SymbolBar, SymbolMatch, SymbolStats, Trade, TradeInput,
+  ApiKeySource, Currency, EquityPoint, FxRefreshResult, FxStatus, Instrument, MentionFeed,
+  PortfolioReviewSnapshot, PortfolioSettings, PortfolioState, PortfolioStats, Position, QuoteFeedStatus, ReviewMotive,
+  ReviewNativeTotal, ReviewRow, ReviewSignals, SymbolBar, SymbolMatch, SymbolStats, Trade, TradeInput,
 } from './types.ts'
 
 /** Daily bars requested per symbol: roughly a trading year. */
@@ -197,6 +198,174 @@ export interface PortfolioServiceOptions {
   readonly web?: (() => WebCapability | undefined) | undefined
 }
 
+// ─── the review read model ───────────────────────────────────────────────────
+
+/** Trading bars one review measures each holding over. */
+const REVIEW_BARS = 60
+
+/**
+ * The window a review quotes as "recent", in trading days.
+ *
+ * Thirty sessions is about a month of trading, and it is also one of the
+ * windows {@link RETURN_WINDOWS} already publishes — a review that invented its
+ * own lookback would be a second definition of "one month" in the same package.
+ */
+const REVIEW_WINDOW_DAYS = 30
+
+/**
+ * The same window, in portfolio curve points.
+ *
+ * The equity curve is one point per calendar day, not per session, so the
+ * portfolio's own recent move is measured over calendar points while a
+ * holding's comes from its stored bars.
+ */
+const REVIEW_WINDOW_POINTS = 20
+
+/** Weights at which a single position is called moderate or high concentration. */
+const CONCENTRATION_MODERATE = 0.25
+const CONCENTRATION_HIGH = 0.4
+
+/** Positions listed in each direction. */
+const REVIEW_ROW_LIMIT = 8
+
+/** Two money amounts are the same number when they agree to a cent. */
+const CENT = 0.005
+
+/**
+ * Band one position's weight.
+ * @param weight - the position's share of the converted portfolio.
+ * @returns the band the review states.
+ */
+function concentrationLabel(weight: number): ReviewSignals['concentrationLabel'] {
+  if (weight >= CONCENTRATION_HIGH) return 'high'
+  if (weight >= CONCENTRATION_MODERATE) return 'moderate'
+  return 'low'
+}
+
+/**
+ * Derive every finding a review leads with from the rows it already measured.
+ *
+ * Pure and local: these are the sentences "how is my portfolio doing" is really
+ * asking for, and computing them here means one place to change a threshold
+ * rather than one place per caller.
+ * @param rows - the measured holdings.
+ * @param stats - the portfolio's own aggregates.
+ * @param totalMarketValue - the converted total the weights are shares of.
+ * @returns the findings.
+ */
+function signalsOf(rows: readonly ReviewRow[], stats: PortfolioStats, totalMarketValue: number): ReviewSignals {
+  const ranked = [...rows].sort((left, right) => right.weight - left.weight)
+  const top = ranked[0] ?? null
+  const priced = rows.filter(row => row.price !== null)
+  const staleCost = rows
+    .filter(row => row.priceAgeDays !== null && row.priceAgeDays > STALE_AFTER_DAYS)
+    .reduce((sum, row) => sum + row.costBase, 0)
+  const byVolatility = [...priced]
+    .filter(row => row.volatility20 !== null)
+    .sort((left, right) => (right.volatility20 ?? 0) - (left.volatility20 ?? 0))[0] ?? null
+  const byDrawdown = [...priced]
+    .filter(row => row.maxDrawdown60 !== null)
+    .sort((left, right) => (right.maxDrawdown60 ?? 0) - (left.maxDrawdown60 ?? 0))[0] ?? null
+  const unrealized = rows.map(row => row.unrealizedPnl).filter((value): value is number => value !== null)
+  return {
+    concentration: top?.weight ?? 0,
+    concentrationSymbol: top === null ? null : top.symbol,
+    concentrationLabel: concentrationLabel(top?.weight ?? 0),
+    topThree: ranked.slice(0, 3).reduce((sum, row) => sum + row.weight, 0),
+    winners: unrealized.filter(value => value > CENT).length,
+    losers: unrealized.filter(value => value < -CENT).length,
+    flat: unrealized.filter(value => Math.abs(value) <= CENT).length,
+    staleShare: stats.totalCost > 0 ? staleCost / stats.totalCost : 0,
+    unpriced: rows.length - priced.length,
+    biggestSymbol: totalMarketValue > 0 ? top?.symbol ?? null : null,
+    mostVolatileSymbol: byVolatility?.symbol ?? null,
+    mostVolatile: byVolatility?.volatility20 ?? null,
+    deepestDrawdownSymbol: byDrawdown?.symbol ?? null,
+    deepestDrawdown: byDrawdown?.maxDrawdown60 ?? null,
+  }
+}
+
+/**
+ * Pre-render the findings, in the order a review should state them.
+ *
+ * The wording is deliberately factual — it reports what the numbers are, not
+ * what to do about them. Advice is the reviewing model's job, because the right
+ * advice depends on what the user just asked and on what the research turns up.
+ * @param stats - the portfolio's aggregates.
+ * @param signals - the derived findings.
+ * @param rows - the measured holdings.
+ * @param baseCurrency - the currency the amounts are stated in.
+ * @param windowReturnPct - the portfolio's recent move, when known.
+ * @returns one line per finding.
+ */
+function notesOf(
+  stats: PortfolioStats,
+  signals: ReviewSignals,
+  rows: readonly ReviewRow[],
+  baseCurrency: Currency,
+  windowReturnPct: number | null,
+): string[] {
+  const notes: string[] = []
+  const pct = (ratio: number): string => `${(ratio * 100).toFixed(1)}%`
+  notes.push(
+    `持仓 ${String(rows.length)} 只，市值 ${stats.totalMarketValue.toFixed(0)} ${baseCurrency}`
+    + `（成本 ${stats.totalCost.toFixed(0)}），浮动 ${stats.totalUnrealizedPnl >= 0 ? '+' : ''}${stats.totalUnrealizedPnl.toFixed(0)}`
+    + `${stats.totalUnrealizedPct === null ? '' : `（${pct(stats.totalUnrealizedPct)}）`}`
+    + `，已实现 ${stats.totalRealizedPnl >= 0 ? '+' : ''}${stats.totalRealizedPnl.toFixed(0)}`,
+  )
+  if (windowReturnPct !== null) {
+    notes.push(`按日线收盘价回溯，最近约一个月（20 个交易日）组合市值${windowReturnPct >= 0 ? '上涨' : '下跌'} ${pct(Math.abs(windowReturnPct))}`)
+  }
+  const nameOf = (symbol: string | null): string => symbol === null
+    ? '—'
+    : rows.find(row => row.symbol === symbol)?.name ?? symbol
+  if (signals.concentrationSymbol !== null) {
+    notes.push(
+      `集中度${signals.concentrationLabel === 'high' ? '偏高' : signals.concentrationLabel === 'moderate' ? '中等' : '较低'}：`
+      + `第一重仓 ${nameOf(signals.concentrationSymbol)} ${pct(signals.concentration)}，前三合计 ${pct(signals.topThree)}`,
+    )
+  }
+  notes.push(`浮盈 ${String(signals.winners)} 只、浮亏 ${String(signals.losers)} 只、基本持平 ${String(signals.flat)} 只`)
+  if (signals.mostVolatileSymbol !== null && signals.mostVolatile !== null) {
+    notes.push(`波动最大的是 ${nameOf(signals.mostVolatileSymbol)}（20 日年化波动率 ${pct(signals.mostVolatile)}）`)
+  }
+  if (signals.deepestDrawdownSymbol !== null && signals.deepestDrawdown !== null && signals.deepestDrawdown > 0) {
+    notes.push(`近 60 个交易日回撤最深的是 ${nameOf(signals.deepestDrawdownSymbol)}（${pct(signals.deepestDrawdown)}）`)
+  }
+  const groups = stats.byMotive
+  if (groups.length > 0) {
+    const best = [...groups].sort((left, right) => right.totalPnl - left.totalPnl)[0]
+    const worst = [...groups].sort((left, right) => left.totalPnl - right.totalPnl)[0]
+    if (best !== undefined && worst !== undefined) {
+      notes.push(`按交易动机：${best.label} ${best.totalPnl >= 0 ? '+' : ''}${best.totalPnl.toFixed(0)} 最好，${worst.label} ${worst.totalPnl.toFixed(0)} 最差`)
+    }
+  }
+  return notes
+}
+
+/**
+ * Pre-render what this read model cannot answer.
+ *
+ * A review is asked for two things and this half is only one of them, so the
+ * caveat list is part of the answer rather than a footnote: an unstated gap is
+ * one a reader fills with an assumption.
+ * @param signals - the derived findings.
+ * @returns one line per caveat.
+ */
+function caveatsOf(signals: ReviewSignals): string[] {
+  const caveats = [
+    '以上全部来自本地日线（收盘价、不含分时）与交易记录，不含行业分类，也不含券商预期、研报、公司公告与新闻。',
+    '第 2 部分（未来约一个月的走势与催化）是研究任务：请用当前的搜索 / 抓取工具按标的一次查清，并标出信息日期与来源。',
+  ]
+  if (signals.unpriced > 0) {
+    caveats.push(`有 ${String(signals.unpriced)} 只持仓还没有任何日线，未计入市值与盈亏。`)
+  }
+  if (signals.staleShare > 0) {
+    caveats.push(`约 ${(signals.staleShare * 100).toFixed(0)}% 的成本对应的最新收盘价已超过 ${String(STALE_AFTER_DAYS)} 天，先刷新行情再看结论。`)
+  }
+  return caveats
+}
+
 /** Everything the dashboard needs, plus the operations that change it. */
 export class PortfolioService {
   readonly db: PortfolioDatabase
@@ -329,6 +498,164 @@ export class PortfolioService {
       feed: this.feedStatus(),
       motives: this.db.listMotives(),
       generatedAt: now.toISOString(),
+    }
+  }
+
+  /**
+   * Everything a portfolio review states about the portfolio as it stands now.
+   *
+   * Local and derived: one pass over the trade log, the latest stored closes and
+   * the stored daily series, with no provider call and no clock beyond "how old
+   * is this bar". That makes the answer reproducible, available offline, and
+   * cheap enough to hand a model — which is the point, because the alternative
+   * is four separate reads the reviewing model has to reconcile itself.
+   *
+   * The forward-looking half of a review is deliberately absent: news, analyst
+   * views and guidance are not stored facts and cannot be computed from a price
+   * series, so they belong to the caller's own search tools.
+   * @returns the review read model.
+   */
+  reviewSnapshot(): PortfolioReviewSnapshot {
+    const now = this.now()
+    const settings = this.db.readSettings()
+    const rates = this.rates(settings)
+    const baseCurrency = settings.baseCurrency
+    const trades = this.db.listTrades()
+    const symbols = [...new Set(trades.map(trade => trade.symbol))]
+    const names = this.db.namesOf(symbols)
+    const quotes = this.db.latestQuotes(now, names)
+    const derived = derivePortfolio({ trades, quotes, baseCurrency, rates, now })
+    const stats = derived.stats
+
+    // One query for the whole portfolio: the stored series is the only source a
+    // review measures from, so it is read once and folded into the rows below.
+    const series = this.db.readBarsFor(symbols, REVIEW_BARS)
+    const ageOf = (date: string | null): number | null => {
+      if (date === null) return null
+      const at = new Date(`${date}T00:00:00`)
+      if (Number.isNaN(at.getTime())) return null
+      return Math.max(0, Math.floor((now.getTime() - at.getTime()) / 86_400_000))
+    }
+
+    const rows: ReviewRow[] = derived.positions.map((position: Position) => {
+      const bars = series.get(position.symbol) ?? []
+      const measured = computeSymbolStats(bars)
+      const window = measured.returns.find(entry => entry.days === REVIEW_WINDOW_DAYS)?.pct ?? null
+      const nativeValue = position.quantity * (position.price ?? 0)
+      return {
+        symbol: position.symbol,
+        name: position.name ?? names.get(position.symbol) ?? null,
+        exchange: position.exchange,
+        currency: position.currency,
+        quantity: position.quantity,
+        avgCost: position.avgCost,
+        price: position.price,
+        priceDate: position.priceDate,
+        marketValueNative: position.price === null ? null : nativeValue,
+        marketValueBase: position.price === null ? null : convert(nativeValue, position.currency, baseCurrency, rates),
+        weight: position.weight,
+        costBase: convert(position.costBasis, position.currency, baseCurrency, rates),
+        unrealizedPnl: position.unrealizedPnl,
+        unrealizedPct: position.unrealizedPct,
+        dayPnlPct: position.dayPnlPct,
+        holdingDays: position.holdingDays,
+        tradeCount: position.tradeCount,
+        return30Pct: window,
+        volatility20: measured.volatility20,
+        maxDrawdown60: measured.maxDrawdown60,
+        rangePosition60: measured.rangePosition60,
+        ma20Gap: measured.ma20Gap,
+        streak: measured.streak,
+        bars: bars.length,
+        priceAgeDays: ageOf(position.priceDate),
+      }
+    })
+
+    // Per-currency subtotals, each computed inside its own currency rather than
+    // summed from converted values: a converted total is a convenience and must
+    // never be presented as the booked number.
+    const nativeCells = new Map<Currency, { marketValue: number, cost: number }>()
+    for (const position of derived.positions) {
+      const cell = nativeCells.get(position.currency) ?? { marketValue: 0, cost: 0 }
+      cell.marketValue += position.price === null ? 0 : position.quantity * position.price
+      cell.cost += position.costBasis
+      nativeCells.set(position.currency, cell)
+    }
+    const native: ReviewNativeTotal[] = [...nativeCells]
+      .map(([currency, cell]) => ({
+        currency,
+        marketValue: cell.marketValue,
+        cost: cell.cost,
+        unrealizedPnl: cell.marketValue - cell.cost,
+        weight: stats.totalMarketValue > 0
+          ? convert(cell.marketValue, currency, baseCurrency, rates) / stats.totalMarketValue
+          : 0,
+      }))
+      .sort((left, right) => right.marketValue - left.marketValue)
+
+    // The portfolio's own recent move, measured the same way a holding's is:
+    // against the stored closes, so it needs no provider round trip. It is a
+    // mark-to-market path over the *current* quantities, not a money-weighted
+    // return — the caveat list says so rather than leaving it implied.
+    const cutoffAt = new Date(now.getTime() - 60 * 86_400_000)
+    const cutoff = `${String(cutoffAt.getFullYear())}-${String(cutoffAt.getMonth() + 1).padStart(2, '0')}-${String(cutoffAt.getDate()).padStart(2, '0')}`
+    const curve = buildEquityCurve({
+      trades,
+      closes: this.db.readCloses(symbols),
+      baseCurrency,
+      rates,
+    }).filter(point => point.date >= cutoff)
+    const recent = curve.slice(-REVIEW_WINDOW_POINTS)
+    const first = recent[0]
+    const last = recent.at(-1)
+    const windowReturnPct = first !== undefined && last !== undefined && first.marketValue > 0
+      ? last.marketValue / first.marketValue - 1
+      : null
+
+    const signals = signalsOf(rows, stats, stats.totalMarketValue)
+    const rankedGainers = rows
+      .filter(row => (row.unrealizedPnl ?? 0) > CENT)
+      .sort((left, right) => (right.unrealizedPnl ?? 0) - (left.unrealizedPnl ?? 0))
+    const rankedLosers = rows
+      .filter(row => (row.unrealizedPnl ?? 0) < -CENT)
+      .sort((left, right) => (left.unrealizedPnl ?? 0) - (right.unrealizedPnl ?? 0))
+    const byMotive: ReviewMotive[] = stats.byMotive.map(row => ({
+      label: row.label,
+      realizedPnl: row.realizedPnl,
+      unrealizedPnl: row.unrealizedPnl,
+      totalPnl: row.totalPnl,
+      trades: row.trades,
+    }))
+
+    return {
+      generatedAt: now.toISOString(),
+      baseCurrency,
+      priceDate: this.db.latestPriceDate(),
+      totals: {
+        marketValue: stats.totalMarketValue,
+        cost: stats.totalCost,
+        unrealizedPnl: stats.totalUnrealizedPnl,
+        unrealizedPct: stats.totalUnrealizedPct,
+        realizedPnl: stats.totalRealizedPnl,
+        totalPnl: stats.totalPnl,
+        dayPnl: stats.dayPnl,
+        dayPnlPct: stats.dayPnlPct,
+        openPositions: stats.openPositions,
+        closedPositions: stats.closedPositions,
+        tradeCount: stats.tradeCount,
+        winRate: stats.winRate,
+        profitFactor: stats.profitFactor,
+      },
+      native,
+      rows,
+      windowReturnPct,
+      topGainers: rankedGainers.slice(0, REVIEW_ROW_LIMIT),
+      topLosers: rankedLosers.slice(0, REVIEW_ROW_LIMIT),
+      byMarket: stats.byMarket,
+      byMotive,
+      signals,
+      notes: notesOf(stats, signals, rows, baseCurrency, windowReturnPct),
+      caveats: caveatsOf(signals),
     }
   }
 

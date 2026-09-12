@@ -64,7 +64,8 @@ import { exchangeLabel, normalizeSymbol } from './symbols.ts'
 import { PortfolioError } from './types.ts'
 import type { PortfolioService } from './service.ts'
 import type {
-  BreakdownRow, ClosedPosition, Currency, Position, Quote, SymbolBar, SymbolMatch, SymbolStats, Trade, TradeSide,
+  BreakdownRow, ClosedPosition, Currency, PortfolioReviewSnapshot, Position, Quote, ReviewRow, SymbolBar,
+  SymbolMatch, SymbolStats, Trade, TradeSide,
 } from './types.ts'
 import type { Context } from '@deepseek-ai/cordis'
 
@@ -175,6 +176,9 @@ export const SEARCH_TOOL = 'stock_search_symbols'
 /** The trade log's individual rows, behind an explicit consent card. */
 export const LIST_TRADES_TOOL = 'stock_list_trades'
 
+/** The portfolio review: the current picture in one read, plus the research checklist. */
+export const REVIEW_TOOL = 'stock_portfolio_review'
+
 /** How many candidate symbols one question offers before the user must type. */
 const SYMBOL_CHOICES = 5
 
@@ -229,6 +233,16 @@ const DESCRIPTION_LIST_TRADES = '读取 DSH 股票持仓插件里的单笔交易
   + '交易记录是用户的隐私数据，这个工具在读取前会自动弹一张授权卡片问用户，用户同意才返回明细，拒绝或没回答都不会返回任何记录。'
   + '所以用户明确说「看看我的交易记录 / 我那几笔买卖」时直接调用它，不要自己先反问；用户没说就别主动读。'
   + '只读，不修改任何记录：改一笔、删一笔仍然在面板里做。'
+
+const DESCRIPTION_REVIEW = '对 DSH 股票持仓插件里的组合做一次复盘，一次调用给全当下该说的数：与面板同一份 SQLite 数据，'
+  + '含总市值、浮动 / 已实现 / 当日盈亏、分币种小计、逐只持仓（权重、成本、浮动盈亏、30 日涨跌幅、20 日波动率、'
+  + '60 日最大回撤、均线偏离、连续涨跌、持有天数）、约一个月的组合市值变化，以及已经算好的集中度、浮盈浮亏家数、'
+  + '行情陈旧度等要点和 caveats。用户问「我的股票表现怎么样」「帮我复盘一下持仓」「我这个组合有什么风险」时调用它，'
+  + '不要靠记忆回答，也不要用几个别的读接口自己拼。'
+  + '读本地日线与交易记录，不请求行情接口、不含行业分类，也**不含**券商预期、研报、公司公告与新闻。'
+  + '所以复盘的第二部分（未来约一个月的走势与催化：行业竞争、券商预期 / 研报、业务进展、管理层变动、新闻动态）'
+  + '要你自己用当前的搜索 / 抓取工具按 research.symbols 里的标的逐只查清，并标出信息日期与来源、区分事实与推测；'
+  + '不要把这个工具没返回的数字编出来。回复克制：先结论后依据，不要长篇大论。'
 
 // ─── parsing and formatting ──────────────────────────────────────────────────
 
@@ -945,6 +959,45 @@ function projectBar(bar: SymbolBar): Record<string, unknown> {
     high: bar.high,
     low: bar.low,
     volume: bar.volume,
+  }
+}
+
+/**
+ * One holding as a review reads it.
+ *
+ * The dashboard projection is the shape for a panel row; this one is the shape
+ * for a judgement, so it states the position against the portfolio (weight,
+ * converted value) and against its own recent behaviour (the indicator block)
+ * in one flat object the model does not have to join.
+ * @param row - the measured holding.
+ * @returns the model-facing row.
+ */
+function projectReviewRow(row: ReviewRow): Record<string, unknown> {
+  return {
+    symbol: row.symbol,
+    exchange: row.exchange,
+    currency: row.currency,
+    quantity: row.quantity,
+    avg_cost: row.avgCost,
+    weight: row.weight,
+    cost: row.costBase,
+    ...row.name === null ? {} : { name: row.name },
+    ...row.price === null ? {} : { price: row.price },
+    ...row.priceDate === null ? {} : { price_date: row.priceDate },
+    ...row.marketValueBase === null ? {} : { market_value: row.marketValueBase },
+    ...row.unrealizedPnl === null ? {} : { unrealized_pnl: row.unrealizedPnl },
+    ...row.unrealizedPct === null ? {} : { unrealized_pct: row.unrealizedPct },
+    ...row.dayPnlPct === null ? {} : { day_pnl_pct: row.dayPnlPct },
+    ...row.holdingDays === null ? {} : { holding_days: row.holdingDays },
+    trade_count: row.tradeCount,
+    ...row.return30Pct === null ? {} : { return30_pct: row.return30Pct },
+    ...row.volatility20 === null ? {} : { volatility20: row.volatility20 },
+    ...row.maxDrawdown60 === null ? {} : { max_drawdown60: row.maxDrawdown60 },
+    ...row.rangePosition60 === null ? {} : { range_position60: row.rangePosition60 },
+    ...row.ma20Gap === null ? {} : { ma20_gap: row.ma20Gap },
+    streak: row.streak,
+    bars: row.bars,
+    ...row.priceAgeDays === null ? {} : { price_age_days: row.priceAgeDays },
   }
 }
 
@@ -1875,6 +1928,182 @@ const TRADES_OUTPUT_SCHEMA: Record<string, unknown> = {
   required: ['ok', 'message', 'consent'],
 }
 
+// ─── the review ──────────────────────────────────────────────────────────────
+
+/** How many holdings a review returns before it says it truncated. */
+const REVIEW_LIMIT = 30
+
+/** The lookbacks a research pass should cover, as one line each. */
+const RESEARCH_ANGLES: readonly string[] = [
+  '行业与竞争：所在行业近一个月的景气变化、对手动作、价格或份额之争',
+  '券商预期 / 研报：最近的目标价、评级调整与盈利预测修正（写清机构与日期）',
+  '业务进展：最近的财报或预告、订单 / 产量 / 销量、监管或政策口径变化',
+  '管理层与股东：人事变动、增减持、回购、股权激励',
+  '新闻与舆情：近一个月的实质新闻、诉讼、事故、供应链或客户变动',
+]
+
+/** What the local read model cannot see, and the caller therefore must fetch. */
+const REVIEW_LIMITS: readonly string[] = [
+  '不含行业 / 板块分类：行业维度只能靠搜索或你自己的判断补，不要假设本工具知道',
+  '估值全部基于本地最新日线收盘价，界面上的价格永远带日期；行情可能滞后',
+  '组合区间变化是按当前数量回溯的市值路径，不是资金加权收益率',
+]
+
+/** How one concentration band reads in the model's view. */
+const CONCENTRATION_LABEL: Readonly<Record<string, string>> = {
+  low: '偏低',
+  moderate: '中等',
+  high: '偏高',
+}
+
+const REVIEW_ROW_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    symbol: { type: 'string' },
+    name: { type: 'string' },
+    exchange: { type: 'string' },
+    currency: { type: 'string' },
+    quantity: { type: 'number' },
+    avg_cost: { type: 'number' },
+    price: { type: 'number' },
+    price_date: { type: 'string' },
+    market_value: { type: 'number', description: '折算为基准货币的市值。' },
+    cost: { type: 'number', description: '折算为基准货币的成本。' },
+    weight: { type: 'number', description: '占组合的比重，0~1。' },
+    unrealized_pnl: { type: 'number' },
+    unrealized_pct: { type: 'number' },
+    day_pnl_pct: { type: 'number' },
+    holding_days: { type: 'number' },
+    trade_count: { type: 'number' },
+    return30_pct: { type: 'number', description: '30 个交易日涨跌幅；日线不足时不给。' },
+    volatility20: { type: 'number', description: '20 日年化波动率。' },
+    max_drawdown60: { type: 'number', description: '近 60 个交易日最大回撤，正数。' },
+    range_position60: { type: 'number', description: '最新收盘在 60 日区间里的位置，0=最低、1=最高。' },
+    ma20_gap: { type: 'number', description: '最新收盘相对 20 日均线的偏离。' },
+    streak: { type: 'number', description: '连涨（正）或连跌（负）天数。' },
+    bars: { type: 'number', description: '本地可用的日线根数。' },
+    price_age_days: { type: 'number', description: '最新收盘价距今多少天。' },
+  },
+  required: ['symbol', 'weight'],
+}
+
+const REVIEW_OUTPUT_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    ok: { type: 'boolean' },
+    message: { type: 'string', description: '给用户看的一段结论，已经按重要性排好序。' },
+    generated_at: { type: 'string' },
+    base_currency: { type: 'string' },
+    price_date: { type: 'string', description: '组合里最新的一根日线的日期。' },
+    totals: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        market_value: { type: 'number' },
+        cost: { type: 'number' },
+        unrealized_pnl: { type: 'number' },
+        unrealized_pct: { type: 'number' },
+        realized_pnl: { type: 'number' },
+        total_pnl: { type: 'number' },
+        day_pnl: { type: 'number' },
+        day_pnl_pct: { type: 'number' },
+        open_positions: { type: 'number' },
+        closed_positions: { type: 'number' },
+        trade_count: { type: 'number' },
+        win_rate: { type: 'number' },
+        profit_factor: { type: 'number' },
+      },
+    },
+    window_return_pct: { type: 'number', description: '约一个月的组合市值变化，见 research.limits。' },
+    native: {
+      type: 'array',
+      description: '分币种小计，均为该币种的原始数值，不做折算。',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          currency: { type: 'string' },
+          market_value: { type: 'number' },
+          cost: { type: 'number' },
+          unrealized_pnl: { type: 'number' },
+          weight: { type: 'number' },
+        },
+        required: ['currency'],
+      },
+    },
+    holdings: { type: 'array', items: REVIEW_ROW_SCHEMA },
+    holdings_truncated: { type: 'boolean' },
+    signals: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        concentration: { type: 'number', description: '第一重仓的占比。' },
+        concentration_symbol: { type: 'string' },
+        concentration_label: { type: 'string', enum: ['low', 'moderate', 'high'] },
+        top_three: { type: 'number' },
+        winners: { type: 'number' },
+        losers: { type: 'number' },
+        flat: { type: 'number' },
+        stale_share: { type: 'number', description: '行情已过期的成本占比。' },
+        unpriced: { type: 'number' },
+        most_volatile_symbol: { type: 'string' },
+        most_volatile: { type: 'number' },
+        deepest_drawdown_symbol: { type: 'string' },
+        deepest_drawdown: { type: 'number' },
+      },
+    },
+    top_gainers: { type: 'array', items: REVIEW_ROW_SCHEMA },
+    top_losers: { type: 'array', items: REVIEW_ROW_SCHEMA },
+    by_market: { type: 'array', items: BREAKDOWN_SCHEMA },
+    by_motive: {
+      type: 'array',
+      description: '按交易动机归集的盈亏：已实现记在卖出动机上，浮动按买入动机分摊。',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          label: { type: 'string' },
+          realized_pnl: { type: 'number' },
+          unrealized_pnl: { type: 'number' },
+          total_pnl: { type: 'number' },
+          trades: { type: 'number' },
+        },
+        required: ['label'],
+      },
+    },
+    notes: { type: 'array', items: { type: 'string' }, description: '已经算好的当下要点。' },
+    research: {
+      type: 'object',
+      description: '第二部分（未来约一个月）的研究清单，由调用方自己去查。',
+      additionalProperties: false,
+      properties: {
+        symbols: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              symbol: { type: 'string' },
+              name: { type: 'string' },
+              exchange: { type: 'string' },
+              weight: { type: 'number' },
+              price_date: { type: 'string' },
+            },
+            required: ['symbol'],
+          },
+        },
+        angles: { type: 'array', items: { type: 'string' } },
+        limits: { type: 'array', items: { type: 'string' } },
+        next: { type: 'array', items: { type: 'string' } },
+      },
+    },
+    focus: { type: 'string' },
+  },
+  required: ['ok', 'message'],
+}
+
 /** The tool that records a trade. */
 function addTradeTool(service: PortfolioService, deps: PortfolioToolDeps): ToolDefinition {
   return {
@@ -2026,9 +2255,174 @@ function searchTool(service: PortfolioService): ToolDefinition {
   }
 }
 
-/** The consent-gated tool that reads the trade log's rows. */
-function listTradesTool(service: PortfolioService, deps: PortfolioToolDeps): ToolDefinition {
+/**
+ * Run one portfolio review.
+ *
+ * The whole point is that this is ONE read: the current picture, the derived
+ * findings and the research checklist arrive together, so the reviewing model
+ * does not spend four calls reconciling four partial answers. The only reason
+ * this is a read rather than a prompt is that the forward-looking half is a
+ * research task — the numbers are facts and belong here, the news does not.
+ * @param rawArgs - the model's arguments.
+ * @param service - the portfolio service.
+ * @returns the tool's canonical result value.
+ */
+function executeReview(rawArgs: unknown, service: PortfolioService): Record<string, unknown> {
+  const args = asRecord(rawArgs)
+  const focus = textOf(args['focus'])
+  const limit = clampLimit(numberOf(args['limit']), REVIEW_LIMIT, POSITION_LIMIT)
+  const snapshot: PortfolioReviewSnapshot = service.reviewSnapshot()
+  const needle = focus?.toUpperCase() ?? null
+  const keeps = (row: ReviewRow): boolean => needle === null
+    || row.symbol.toUpperCase().includes(needle)
+    || (row.name ?? '').toUpperCase().includes(needle)
+  const selected = needle === null ? snapshot.rows : snapshot.rows.filter(keeps)
+  const rows = selected.slice(0, limit)
+
+  if (snapshot.rows.length === 0) {
+    return {
+      ok: true,
+      message: '组合里还没有持仓，没有可复盘的标的。先说一笔交易（例如「昨天买了 100 股腾讯」）或直接说想买什么，我再看。',
+      generated_at: snapshot.generatedAt,
+      base_currency: snapshot.baseCurrency,
+      holdings: [],
+      holdings_truncated: false,
+      notes: [],
+      research: { symbols: [], angles: [], limits: [], next: [] },
+    }
+  }
+
+  const pct = (ratio: number): string => `${(ratio * 100).toFixed(1)}%`
+  // One line, not the whole findings list: the findings are rendered directly
+  // underneath, and a message that repeats them doubles the model's reading for
+  // no extra information.
+  const ups = snapshot.totals.unrealizedPnl >= 0 ? '浮盈' : '浮亏'
+  const scopeNote = rows.length === snapshot.rows.length
+    ? `共 ${String(rows.length)} 只持仓`
+    : `列出 ${String(rows.length)} 只（组合共 ${String(snapshot.rows.length)} 只）`
+  const message = rows.length === 0
+    ? `组合里没有匹配「${focus ?? ''}」的持仓；当前共 ${String(snapshot.rows.length)} 只。`
+    : `复盘${focus === null ? '整个组合' : `「${focus}」`}：${scopeNote}，`
+      + `市值 ${snapshot.totals.marketValue.toFixed(0)} ${snapshot.baseCurrency}`
+      + `（${ups} ${snapshot.totals.unrealizedPnl.toFixed(0)}`
+      + `${snapshot.totals.unrealizedPct === null ? '' : `，${pct(snapshot.totals.unrealizedPct)}`}），`
+      + `第一重仓占 ${pct(snapshot.signals.concentration)}`
+      + `（集中度${CONCENTRATION_LABEL[snapshot.signals.concentrationLabel] ?? '未知'}）；`
+      + `行情日期 ${snapshot.priceDate ?? '未知'}，以下是当下数据，未来一个月的走势与催化需要你自己查。`
+
   return {
+    ok: true,
+    message,
+    generated_at: snapshot.generatedAt,
+    base_currency: snapshot.baseCurrency,
+    ...snapshot.priceDate === null ? {} : { price_date: snapshot.priceDate },
+    totals: {
+      market_value: snapshot.totals.marketValue,
+      cost: snapshot.totals.cost,
+      unrealized_pnl: snapshot.totals.unrealizedPnl,
+      realized_pnl: snapshot.totals.realizedPnl,
+      total_pnl: snapshot.totals.totalPnl,
+      day_pnl: snapshot.totals.dayPnl,
+      open_positions: snapshot.totals.openPositions,
+      closed_positions: snapshot.totals.closedPositions,
+      trade_count: snapshot.totals.tradeCount,
+      ...snapshot.totals.unrealizedPct === null ? {} : { unrealized_pct: snapshot.totals.unrealizedPct },
+      ...snapshot.totals.dayPnlPct === null ? {} : { day_pnl_pct: snapshot.totals.dayPnlPct },
+      ...snapshot.totals.winRate === null ? {} : { win_rate: snapshot.totals.winRate },
+      ...snapshot.totals.profitFactor === null ? {} : { profit_factor: snapshot.totals.profitFactor },
+    },
+    ...snapshot.windowReturnPct === null ? {} : { window_return_pct: snapshot.windowReturnPct },
+    native: snapshot.native.map(total => ({
+      currency: total.currency,
+      market_value: total.marketValue,
+      cost: total.cost,
+      unrealized_pnl: total.unrealizedPnl,
+      weight: total.weight,
+    })),
+    holdings: rows.map(projectReviewRow),
+    holdings_truncated: selected.length > rows.length,
+    signals: {
+      concentration: snapshot.signals.concentration,
+      top_three: snapshot.signals.topThree,
+      concentration_label: snapshot.signals.concentrationLabel,
+      winners: snapshot.signals.winners,
+      losers: snapshot.signals.losers,
+      flat: snapshot.signals.flat,
+      stale_share: snapshot.signals.staleShare,
+      unpriced: snapshot.signals.unpriced,
+      ...snapshot.signals.concentrationSymbol === null ? {} : { concentration_symbol: snapshot.signals.concentrationSymbol },
+      ...snapshot.signals.mostVolatileSymbol === null ? {} : { most_volatile_symbol: snapshot.signals.mostVolatileSymbol },
+      ...snapshot.signals.mostVolatile === null ? {} : { most_volatile: snapshot.signals.mostVolatile },
+      ...snapshot.signals.deepestDrawdownSymbol === null
+        ? {} : { deepest_drawdown_symbol: snapshot.signals.deepestDrawdownSymbol },
+      ...snapshot.signals.deepestDrawdown === null ? {} : { deepest_drawdown: snapshot.signals.deepestDrawdown },
+    },
+    top_gainers: snapshot.topGainers.map(projectReviewRow),
+    top_losers: snapshot.topLosers.map(projectReviewRow),
+    by_market: snapshot.byMarket.map(projectBreakdown),
+    by_motive: snapshot.byMotive.map(row => ({
+      label: row.label,
+      realized_pnl: row.realizedPnl,
+      unrealized_pnl: row.unrealizedPnl,
+      total_pnl: row.totalPnl,
+      trades: row.trades,
+    })),
+    notes: snapshot.notes,
+    research: {
+      symbols: rows.map(row => ({
+        symbol: row.symbol,
+        exchange: row.exchange,
+        weight: row.weight,
+        ...row.name === null ? {} : { name: row.name },
+        ...row.priceDate === null ? {} : { price_date: row.priceDate },
+      })),
+      angles: [...RESEARCH_ANGLES],
+      limits: [...snapshot.caveats, ...REVIEW_LIMITS],
+      next: [
+        `逐只搜「${rows.map(row => row.name ?? row.symbol).join('、')}」的券商目标价 / 评级调整、最近财报或预告日期、公告与管理层变动。`,
+        `行业层面搜一次板块近况与主要对手动作${rows.length === 0 ? '' : `（${rows.map(row => row.symbol).join(' / ')} 共占 ${pct(snapshot.signals.topThree)} 仓位）`}。`,
+        '每条写清信息日期与来源，区分「已发生」与「预期」；不要给出确定的价格预测，也不要编造工具没返回的数字。',
+        '最终回复控制在一屏内：先当下结论与风险，再一个月视角的催化与变量，最后一句免责。',
+      ],
+    },
+    ...needle === null ? {} : { focus: focus ?? '' },
+  }
+}
+
+/** The tool that reviews the portfolio as one read. */
+function reviewTool(service: PortfolioService): ToolDefinition {
+  return {
+    name: REVIEW_TOOL,
+    description: DESCRIPTION_REVIEW,
+    parameters: {
+      type: 'object',
+      properties: {
+        focus: {
+          type: 'string',
+          description: '只复盘这一只（代码或名称片段）；不传就是整个组合。复盘整个组合时留空。',
+        },
+        limit: {
+          type: 'number',
+          description: `最多返回多少行持仓，默认 ${String(REVIEW_LIMIT)}，最多 ${String(POSITION_LIMIT)}。`,
+        },
+      },
+    },
+    output: { schema: REVIEW_OUTPUT_SCHEMA, render: renderReview },
+    execute(args: unknown): Promise<unknown> {
+      return Promise.resolve(executeReview(args, service))
+    },    presentCall(args: unknown): ToolCallView | undefined {
+      try {
+        const focus = textOf(asRecord(args)['focus'])
+        return { card: 'generic', title: focus === null ? '复盘持仓' : `复盘 ${focus}` }
+      } catch {
+        return undefined
+      }
+    },
+  }
+}
+
+/** The consent-gated tool that reads the trade log's rows. */
+function listTradesTool(service: PortfolioService, deps: PortfolioToolDeps): ToolDefinition {  return {
     name: LIST_TRADES_TOOL,
     description: DESCRIPTION_LIST_TRADES,
     parameters: {
@@ -2176,9 +2570,128 @@ function renderAnalysis(_args: unknown, value: unknown): readonly TextBlock[] {
   return [{ type: 'text', text: lines.join('\n') }]
 }
 
-/** What the model reads as an index search. */
-function renderSearch(_args: unknown, value: unknown): readonly TextBlock[] {
+/** One review holding as a line of the model's view. */
+function reviewRowLine(row: Record<string, unknown>): string {
+  const name = textOf(row['name'])
+  const parts: string[] = [
+    `${textOf(row['symbol']) ?? ''}${name === null ? '' : ` ${name}`}`,
+    `仓位 ${(numberValue(row['weight']) * 100).toFixed(1)}%`,
+    `浮动 ${signed(numberValue(row['unrealized_pnl']))}`,
+  ]
+  if (typeof row['unrealized_pct'] === 'number') parts.push(percent(row['unrealized_pct']))
+  if (typeof row['price'] === 'number') {
+    parts.push(`现价 ${plain(row['price'])}${textOf(row['price_date']) === null ? '' : `（${textOf(row['price_date']) ?? ''}）`}`)
+  }
+  if (typeof row['return30_pct'] === 'number') parts.push(`30 日 ${percent(row['return30_pct'])}`)
+  if (typeof row['volatility20'] === 'number') parts.push(`波动率 ${(row['volatility20'] * 100).toFixed(1)}%`)
+  if (typeof row['max_drawdown60'] === 'number') parts.push(`60 日回撤 ${(row['max_drawdown60'] * 100).toFixed(1)}%`)
+  if (typeof row['ma20_gap'] === 'number') parts.push(`20 日均线偏离 ${percent(row['ma20_gap'])}`)
+  if (typeof row['holding_days'] === 'number') parts.push(`持有 ${String(row['holding_days'])} 天`)
+  return `- ${parts.join(' · ')}`
+}
+
+/**
+ * What the model reads as a portfolio review.
+ *
+ * Same contract as {@link renderResult}: the rows and the derived findings have
+ * to be spelled out here, because this projection is the model's entire view.
+ * The research block is the exception — it is instructions for the caller, so
+ * it states the scope and the angles rather than anything about the portfolio.
+ */
+function renderReview(_args: unknown, value: unknown): readonly TextBlock[] {
   const result = asRecord(value)
+  const lines: string[] = []
+  const message = textOf(result['message'])
+  if (message !== null) lines.push(message)
+
+  const totals = asRecord(result['totals'])
+  if (Object.keys(totals).length > 0) {
+    lines.push(`基准货币 ${textOf(result['base_currency']) ?? ''}`
+      + ` · 市值 ${money(numberValue(totals['market_value']))}`
+      + ` · 成本 ${money(numberValue(totals['cost']))}`
+      + ` · 浮动 ${signed(numberValue(totals['unrealized_pnl']))}`
+      + ` · 已实现 ${signed(numberValue(totals['realized_pnl']))}`
+      + ` · 当日 ${signed(numberValue(totals['day_pnl']))}`
+      + `${typeof totals['unrealized_pct'] === 'number' ? ` · 浮动比例 ${percent(totals['unrealized_pct'])}` : ''}`)
+  }
+  for (const entry of Array.isArray(result['native']) ? result['native'] : []) {
+    const row = asRecord(entry)
+    lines.push(`${textOf(row['currency']) ?? ''}：市值 ${money(numberValue(row['market_value']))}`
+      + ` · 成本 ${money(numberValue(row['cost']))}`
+      + ` · 浮动 ${signed(numberValue(row['unrealized_pnl']))}`
+      + ` · 占比 ${(numberValue(row['weight']) * 100).toFixed(1)}%`)
+  }
+  if (typeof result['window_return_pct'] === 'number') {
+    lines.push(`最近约一个月的组合市值变化：${percent(result['window_return_pct'])}`)
+  }
+
+  const signals = asRecord(result['signals'])
+  if (Object.keys(signals).length > 0) {
+    const findings: string[] = []
+    if (typeof signals['concentration'] === 'number') {
+      findings.push(`第一重仓 ${textOf(signals['concentration_symbol']) ?? ''}`
+        + ` ${percent(signals['concentration'])}`
+        + `（集中度${CONCENTRATION_LABEL[textOf(signals['concentration_label']) ?? ''] ?? '未知'}）`)
+    }
+    if (typeof signals['top_three'] === 'number') findings.push(`前三合计 ${percent(signals['top_three'])}`)
+    findings.push(`浮盈 ${plain(numberValue(signals['winners']))} / 浮亏 ${plain(numberValue(signals['losers']))} / 持平 ${plain(numberValue(signals['flat']))}`)
+    if (typeof signals['most_volatile'] === 'number') {
+      findings.push(`波动最大 ${textOf(signals['most_volatile_symbol']) ?? ''} ${(signals['most_volatile'] * 100).toFixed(1)}%`)
+    }
+    if (typeof signals['deepest_drawdown'] === 'number') {
+      findings.push(`回撤最深 ${textOf(signals['deepest_drawdown_symbol']) ?? ''} ${(signals['deepest_drawdown'] * 100).toFixed(1)}%`)
+    }
+    if (typeof signals['stale_share'] === 'number' && signals['stale_share'] > 0) {
+      findings.push(`行情过期成本占比 ${(signals['stale_share'] * 100).toFixed(0)}%`)
+    }
+    lines.push(findings.join(' · '))
+  }
+
+  const holdings = Array.isArray(result['holdings']) ? result['holdings'] : []
+  if (holdings.length > 0) {
+    lines.push('持仓：')
+    for (const entry of holdings) lines.push(reviewRowLine(asRecord(entry)))
+  }
+  if (result['holdings_truncated'] === true) lines.push('（还有更多持仓没列出）')
+
+  for (const key of ['top_gainers', 'top_losers'] as const) {
+    const rows = Array.isArray(result[key]) ? result[key] : []
+    if (rows.length === 0) continue
+    lines.push(`${key === 'top_gainers' ? '浮盈最多' : '浮亏最多'}：`)
+    for (const entry of rows) lines.push(reviewRowLine(asRecord(entry)))
+  }
+  for (const entry of Array.isArray(result['by_market']) ? result['by_market'] : []) {
+    lines.push(breakdownLine(asRecord(entry)))
+  }
+  for (const entry of Array.isArray(result['by_motive']) ? result['by_motive'] : []) {
+    const row = asRecord(entry)
+    lines.push(`动机「${textOf(row['label']) ?? ''}」：${plain(numberValue(row['trades']))} 笔`
+      + ` · 已实现 ${signed(numberValue(row['realized_pnl']))}`
+      + ` · 浮动 ${signed(numberValue(row['unrealized_pnl']))}`
+      + ` · 合计 ${signed(numberValue(row['total_pnl']))}`)
+  }
+  for (const note of stringList(result['notes'])) lines.push(`· ${note}`)
+
+  const research = asRecord(result['research'])
+  const scope = Array.isArray(research['symbols']) ? research['symbols'] : []
+  if (scope.length > 0) {
+    lines.push('第二部分（未来约一个月）的研究范围：')
+    for (const entry of scope) {
+      const row = asRecord(entry)
+      const name = textOf(row['name'])
+      lines.push(`- ${textOf(row['symbol']) ?? ''}${name === null ? '' : ` ${name}`}`
+        + ` · 仓位 ${(numberValue(row['weight']) * 100).toFixed(1)}%`)
+    }
+  }
+  for (const angle of stringList(research['angles'])) lines.push(`· 查：${angle}`)
+  for (const limit of stringList(research['limits'])) lines.push(`· 注意：${limit}`)
+  for (const step of stringList(research['next'])) lines.push(`· 下一步：${step}`)
+
+  return [{ type: 'text', text: lines.join('\n') }]
+}
+
+/** What the model reads as an index search. */
+function renderSearch(_args: unknown, value: unknown): readonly TextBlock[] {  const result = asRecord(value)
   const lines: string[] = []
   const message = textOf(result['message'])
   if (message !== null) lines.push(message)
@@ -2334,6 +2847,7 @@ export function createPortfolioTools(
     overviewTool(service),
     symbolDetailTool(service, deps),
     analysisTool(service),
+    reviewTool(service),
     searchTool(service),
     listTradesTool(service, deps),
   ]
@@ -2345,19 +2859,38 @@ export function createPortfolioTools(
  * Registration happens once per plugin load and is undone with the plugin: the
  * disposable returned by `tools.register` is owned by the plugin's own effect
  * scope, so a reload, a stop or an uninstall leaves no tool behind.
+ *
+ * ## Why this waits instead of sampling
+ *
+ * `ctx.get('tools')` is a ONE-TIME read, and a Loader row may be applied before
+ * the row that provides the registry. Sampling once therefore does not degrade
+ * gracefully, it silently registers nothing at all — and the failure mode is
+ * invisible: the panel and the slash command keep working, so the only symptom
+ * is a model that says it cannot review the portfolio. That is exactly what a
+ * cold start produced, while a hot reload (applied after the registry already
+ * existed) looked fine.
+ *
+ * `ctx.inject` is the harness's own optional-registration path for this: the
+ * callback runs as soon as the service appears, and immediately when it is
+ * already there. The synchronous lookup below is only the diagnostic — it fires
+ * while a miss still means something, rather than after a delay that would also
+ * be reached the moment a late registry arrives.
  * @param ctx - the plugin context.
  * @param service - the portfolio service.
  */
 export function registerPortfolioTools(ctx: Context, service: PortfolioService): void {
-  const tools = ctx.get('tools') as ToolRegistry | undefined
-  if (tools === undefined) {
-    // A composition without a tool registry is a legitimate one (a headless
-    // service host); the dashboard half still works, so this is a note.
-    console.warn('[stock-portfolio] ctx.tools is not mounted; the chat tools are unavailable')
-    return
+  if (ctx.get('tools') === undefined) {
+    // A composition that has not mounted the registry YET is the common case
+    // here, so this is a note rather than a failure; a composition that never
+    // mounts one is the legitimate headless case.
+    console.warn('[stock-portfolio] tool registry is not up yet; the chat tools will register when it is')
   }
-  const userQuestions = ctx.get('userQuestions') as UserQuestionsCapability | undefined
-  for (const tool of createPortfolioTools(service, { userQuestions })) {
-    ctx.effect(() => tools.register(tool), `stock-portfolio: tool ${tool.name}`)
-  }
+  ctx.inject(['tools'], (scope: Context) => {
+    const tools = scope.get('tools') as ToolRegistry | undefined
+    if (tools === undefined) return
+    const userQuestions = scope.get('userQuestions') as UserQuestionsCapability | undefined
+    for (const tool of createPortfolioTools(service, { userQuestions })) {
+      scope.effect(() => tools.register(tool), `stock-portfolio: tool ${tool.name}`)
+    }
+  })
 }

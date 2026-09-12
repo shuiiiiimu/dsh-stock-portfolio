@@ -17,7 +17,7 @@ import { join } from 'node:path'
 import { after, test } from 'node:test'
 
 import {
-  ADD_TRADE_TOOL, ANALYSIS_TOOL, LIST_TRADES_TOOL, OVERVIEW_TOOL, SEARCH_TOOL, SYMBOL_DETAIL_TOOL,
+  ADD_TRADE_TOOL, ANALYSIS_TOOL, LIST_TRADES_TOOL, OVERVIEW_TOOL, REVIEW_TOOL, SEARCH_TOOL, SYMBOL_DETAIL_TOOL,
   PortfolioService, createPortfolioTools, registerPortfolioTools,
 } from '../lib/index.js'
 
@@ -778,7 +778,7 @@ test('every declared schema stays inside the enforced subset', () => {
   const tools = createPortfolioTools(service, { now: () => NOW })
 
   assert.deepEqual(tools.map(tool => tool.name), [
-    ADD_TRADE_TOOL, OVERVIEW_TOOL, SYMBOL_DETAIL_TOOL, ANALYSIS_TOOL, SEARCH_TOOL, LIST_TRADES_TOOL,
+    ADD_TRADE_TOOL, OVERVIEW_TOOL, SYMBOL_DETAIL_TOOL, ANALYSIS_TOOL, REVIEW_TOOL, SEARCH_TOOL, LIST_TRADES_TOOL,
   ])
   for (const tool of tools) {
     assert.deepEqual(schemaViolations(tool.output.schema), [], `${tool.name} output schema`)
@@ -788,38 +788,95 @@ test('every declared schema stays inside the enforced subset', () => {
   }
 })
 
-test('registration publishes every tool and disposes with the plugin', () => {
-  const service = makeService()
+/** The order every case below asserts on. */
+const TOOL_ORDER = [
+  ADD_TRADE_TOOL, OVERVIEW_TOOL, SYMBOL_DETAIL_TOOL, ANALYSIS_TOOL, REVIEW_TOOL, SEARCH_TOOL, LIST_TRADES_TOOL,
+]
+
+/**
+ * A context with a tool registry that may not exist yet.
+ *
+ * `inject` behaves like the harness's: the callback runs as soon as the named
+ * service exists — immediately when it already does, and on {@link arrive} when
+ * the row mounts later. That late path is where the cold-start bug lived.
+ * @param options - `registry: 'late'` to mount it only on `arrive`; `'never'` to
+ *   mount none at all.
+ * @returns the context, what was registered and disposed, and the late trigger.
+ */
+function toolContext(options = {}) {
   const registered = []
   const disposed = []
   const disposers = []
+  const pending = []
+  const mount = () => ({ register: tool => { registered.push(tool.name); return () => disposed.push(tool.name) } })
+  let registry = options.registry === 'late' || options.registry === 'never' ? undefined : mount()
   const ctx = {
-    get: name => name === 'tools'
-      ? { register: tool => { registered.push(tool.name); return () => disposed.push(tool.name) } }
-      : undefined,
+    get: name => (name === 'tools' ? registry : undefined),
     effect: work => { disposers.push(work()) },
+    inject: (deps, callback) => {
+      assert.deepEqual(deps, ['tools'])
+      if (registry !== undefined) callback(ctx)
+      else pending.push(callback)
+      return () => {}
+    },
   }
+  return {
+    ctx,
+    registered,
+    disposed,
+    disposers,
+    /** Mount the registry now, as the harness does when its row applies. */
+    arrive: () => {
+      registry = mount()
+      for (const callback of pending) callback(ctx)
+    },
+  }
+}
+
+test('registration publishes every tool and disposes with the plugin', () => {
+  const service = makeService()
+  const { ctx, registered, disposed, disposers } = toolContext()
 
   registerPortfolioTools(ctx, service)
 
-  const expected = [
-    ADD_TRADE_TOOL, OVERVIEW_TOOL, SYMBOL_DETAIL_TOOL, ANALYSIS_TOOL, SEARCH_TOOL, LIST_TRADES_TOOL,
-  ]
-  assert.deepEqual(registered, expected)
+  assert.deepEqual(registered, TOOL_ORDER)
   for (const disposer of disposers) disposer()
-  assert.deepEqual(disposed, expected)
+  assert.deepEqual(disposed, TOOL_ORDER)
 })
 
-test('a composition without a tool registry is a note, not a crash', () => {
+test('a registry that mounts after the plugin still receives every tool', () => {
+  // The cold-start bug: the Loader applied this row before the registry row, a
+  // one-time `ctx.get` saw nothing, and the catalog lost all seven stock tools
+  // with no visible symptom beyond a model that could not review anything.
   const service = makeService()
+  const { ctx, registered, arrive } = toolContext({ registry: 'late' })
+
   const warnings = []
   const original = console.warn
   console.warn = (...values) => { warnings.push(values.join(' ')) }
   try {
-    registerPortfolioTools({ get: () => undefined, effect: () => { throw new Error('must not register') } }, service)
+    registerPortfolioTools(ctx, service)
   } finally {
     console.warn = original
   }
-  assert.equal(warnings.length, 1)
-  assert.match(warnings[0], /ctx\.tools is not mounted/)
+  assert.deepEqual(registered, [], 'nothing can be registered before the registry exists')
+  assert.ok(warnings.some(line => line.includes('not up yet')))
+
+  arrive()
+  assert.deepEqual(registered, TOOL_ORDER)
+})
+
+test('a composition with no tool registry is noted, not crashed into', () => {
+  const service = makeService()
+  const { ctx, registered } = toolContext({ registry: 'never' })
+  const warnings = []
+  const original = console.warn
+  console.warn = (...values) => { warnings.push(values.join(' ')) }
+  try {
+    registerPortfolioTools(ctx, service)
+  } finally {
+    console.warn = original
+  }
+  assert.deepEqual(registered, [])
+  assert.ok(warnings.some(line => line.includes('not up yet')))
 })

@@ -61,6 +61,23 @@ declare module '@deepseek-ai/dsh-client-ui-sidebar/client' {}
 declare module '@deepseek-ai/dsh-client-ui-layout/client' {}
 
 /**
+ * The `/` menu's command surface. Type-only: the contribution's shape is
+ * declared structurally in `src/client/review-command.ts`, and this block exists
+ * so that module resolves without a dependency on the harness package.
+ * Mirrors `packages/client/ui-commands/src/client/contract.ts`.
+ */
+declare module '@deepseek-ai/dsh-client-ui-commands/client' {}
+
+/** Mirrors `packages/client/ui-conversation/src/client/index.ts` (type-only). */
+declare module '@deepseek-ai/dsh-client-ui-conversation/client' {}
+
+/** Mirrors `packages/client/locale/src/client/index.ts` (type-only). */
+declare module '@deepseek-ai/dsh-client-ui-locale/client' {}
+
+/** Mirrors `packages/client/ui-session/src/client/index.ts` (type-only). */
+declare module '@deepseek-ai/dsh-client-ui-session/client' {}
+
+/**
  * Mirrors the seeded platform module table
  * (`packages/client/web/src/seed.ts`). Only these specifiers may stay external
  * in a client bundle; the ones used here are declared structurally rather than
@@ -89,6 +106,8 @@ declare module '@deepseek-ai/dsh-client-ui-primitives' {
   export const IconEditOutline16: Icon
   export const IconSearchOutline16: Icon
   export const IconDownloadOutline16: Icon
+  /** A gauge: used for the portfolio-review command row. */
+  export const IconGaugeOutline16: Icon
   /** Hover tooltip wrapper. */
   export const Tooltip: (props: {
     label: string
@@ -144,5 +163,7 @@ declare module '@deepseek-ai/cordis' {
     readonly locale: {
       register(namespace: string, dictionaries: Record<string, unknown>): () => void
     }
+    /** The `/` menu's command registry (client half only; may be absent). */
+    readonly commandUi?: unknown
   }
 }

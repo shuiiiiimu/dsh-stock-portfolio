@@ -1,7 +1,7 @@
 /**
  * dsh-stock-portfolio — browser half.
  *
- * Contributes three cells and owns one store:
+ * Contributes three cells, one command, and owns one store:
  *
  *   `sidebar.footer.action` — the trigger row, rendered by the sidebar ABOVE
  *                             its Settings seat. A fresh list id and an `order`
@@ -16,8 +16,12 @@
  *                             tab type, which is a two-stage registration this
  *                             file performs inside the slot injection — see
  *                             {@link MentionsPanel}.
+ *   `/portfolio-review`     — the slash-menu row for a review, contributed
+ *                             client-side because only a client row carries a
+ *                             localized label and an icon. See
+ *                             {@link applyReviewCommand}.
  *
- * All three read the same {@link PortfolioStore} through the registration's
+ * All of them read the same {@link PortfolioStore} through the registration's
  * `hooks` face, which the renderer turns into a `usePortfolio(selector)` prop.
  * The store is created here, in the plugin's own closure, and released by
  * `ctx.effect` when the plugin unloads. The conversation watcher that feeds the
@@ -33,6 +37,7 @@ import { SessionWatcher } from './SessionWatcher.tsx'
 import { SidebarEntry } from './SidebarEntry.tsx'
 import { MENTIONS_ID, MENTIONS_KIND, MentionsPanel, mentionsDefinition } from './MentionsPanel.tsx'
 import type { SidebarRightFace, SidebarRightTabsFace } from './MentionsPanel.tsx'
+import { applyReviewCommand } from './review-command.ts'
 import { createPortfolioStore } from './store.ts'
 import { STYLE_TAG_ID, STYLES } from './styles.ts'
 
@@ -176,13 +181,19 @@ export function apply(ctx: Context): void {
     key: MENTIONS_ID,
     inject: face,
   }, MentionsPanel))
+
+  // The slash-menu row. A client contribution rather than a Host command,
+  // because only a contribution can carry the localized label and the icon —
+  // see the module's own header for why the two cannot share one name.
+  applyReviewCommand(ctx)
 }
 
 // The entry's exports are for the tests: the shell consumes `apply` and
 // `inject` and nothing else. What is here is what a case reaches for — the cells
 // that cannot be mounted through a slot without a click or a conversation turn,
-// and the tab definition they register.
+// the tab definition they register, and the command contribution.
 export { createPortfolioStore, mentionedSymbols } from './store.ts'
+export { applyReviewCommand, REVIEW_COMMAND, REVIEW_PROMPT } from './review-command.ts'
 export { Dashboard } from './Dashboard.tsx'
 export { Holdings } from './tabs/Holdings.tsx'
 export { Overview } from './tabs/Overview.tsx'
