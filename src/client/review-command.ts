@@ -37,7 +37,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-commands/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-session/client'
-import { IconGaugeOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconGaugeOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 
 /** The command's name, without the leading slash and stable across locales. */
 export const REVIEW_COMMAND = 'portfolio-review'
@@ -141,7 +141,7 @@ export function applyReviewCommand(ctx: Context): void {
       // next menu open without re-registering.
       label: () => (isChinese(scope) ? LABEL_ZH : LABEL_EN),
       description: () => (isChinese(scope) ? DESCRIPTION_ZH : DESCRIPTION_EN),
-      icon: IconGaugeOutline16,
+      icon: IconGaugeOutlineRegular,
       // Reviewing is always applicable — an empty portfolio is a legitimate
       // answer, not a reason to hide the row.
       available: () => true,

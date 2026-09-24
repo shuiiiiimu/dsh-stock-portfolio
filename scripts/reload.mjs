@@ -1,20 +1,30 @@
 /**
  * Point a running `dsh` at this checkout's newest Host bundle.
  *
- * Node caches an ES module by resolved URL, so re-applying a profile patch that
- * names the same file hands the Loader the module it already has. `npm run
- * build` therefore also writes a content-addressed copy (`lib/index.dev.<digest>.js`),
- * and this script rewrites the profile row to name the newest one and touches the
- * patch file so the live watcher re-applies it.
+ * The plugin is installed as a normal profile bundle (`dsh plugin --profile web
+ * add <checkout>`) — the plugin manager writes it into `dsh.profile.bundles` and
+ * links the checkout into the profile's node_modules, so the package's own
+ * `cordis.patch.yml` supplies the `stock-portfolio` row and the row loads
+ * `lib/index.js` by default. This script adds the DEV OVERRIDE on top of that
+ * row: a profile patch row with the same id whose `name` names the
+ * content-addressed `lib/index.dev.<digest>.js`.
+ *
+ * The digest is why the override exists. Node caches an ES module by resolved
+ * URL, so re-applying a patch that names the same file hands the Loader the
+ * module it already has; a rebuild writes a NEW digest, which is a URL the Loader
+ * has never imported. That is what makes a Host-side change live without
+ * restarting `dsh`, on top of the manager-installed bundle rather than instead
+ * of it. Without the override the mounted row keeps the package entry
+ * `lib/index.js`, and a Host-side change then needs a `dsh` restart.
  *
  * Every path is resolved at run time — `$DSH_HOME` (or `~/.dsh`), the profile
- * directory found by looking at which patch mentions this plugin, and the
- * relative hop from that profile back to `lib/` — so neither this script nor the
- * patch file has to carry a hard-coded home directory. The row keeps a RELATIVE
- * name, which DSH itself anchors to the patch file's directory.
+ * directory holding the override row, and the relative hop from that profile
+ * back to `lib/` — so neither this script nor the patch file has to carry a
+ * hard-coded home directory. The row keeps a RELATIVE name, which DSH itself
+ * anchors to the patch file's directory.
  *
  * Usage: `npm run reload` (after `npm run build`), optionally with
- * `DSH_PROFILE=<name>` when more than one profile mounts the plugin.
+ * `DSH_PROFILE=<name>` when more than one profile has the plugin installed.
  *
  * The patch is REPLACED ATOMICALLY (write beside it, then rename) and read back
  * before this script reports success. A patch file is read by the live watcher
@@ -30,6 +40,8 @@ import { fileURLToPath } from 'node:url'
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const PACKAGE_NAME = 'dsh-stock-portfolio'
 const ROW_ID = 'stock-portfolio'
+/** Comment line marking this checkout's dev override, wherever this script wrote it. */
+const MARKER = `# --- ${PACKAGE_NAME} dev override ---`
 
 /**
  * Replace one file's contents without ever exposing a partial file.
@@ -76,25 +88,31 @@ function dshHome() {
 }
 
 /**
- * Find the profile patches that mount this plugin.
+ * Find the profile whose manifest lists this bundle.
+ *
+ * The bundle lives in `package.json`'s `dsh.profile.bundles` (the plugin
+ * manager's own record) and the override lives in the same directory's
+ * `cordis.patch.yml`, so one search answers both.
  * @param home - the harness home.
- * @returns absolute patch-file paths, in profile-name order.
+ * @returns object with the manifest and patch paths, or `null` when no profile selects it.
  */
-function patchFiles(home) {
+function findProfile(home) {
   const profiles = join(home, 'profiles')
-  if (!existsSync(profiles)) return []
+  if (!existsSync(profiles)) return null
   const wanted = process.env.DSH_PROFILE?.trim()
-  return readdirSync(profiles)
-    .filter(name => wanted === undefined || wanted === '' || name === wanted)
-    .map(name => join(profiles, name, 'cordis.patch.yml'))
-    .filter(file => existsSync(file) && readFileSync(file, 'utf8').includes(ROW_ID))
+  for (const name of readdirSync(profiles)) {
+    if (wanted !== undefined && wanted !== '' && name !== wanted) continue
+    const manifest = join(profiles, name, 'package.json')
+    if (!existsSync(manifest)) continue
+    const parsed = JSON.parse(readFileSync(manifest, 'utf8'))
+    const bundles = parsed?.dsh?.profile?.bundles
+    if (Array.isArray(bundles) && bundles.includes(PACKAGE_NAME)) {
+      return { patch: join(profiles, name, 'cordis.patch.yml') }
+    }
+  }
+  return null
 }
 
-/**
- * The newest content-addressed Host bundle, or the canonical one when no dev
- * copy exists yet.
- * @returns the absolute bundle path.
- */
 /**
  * The newest content-addressed Host bundle, or the canonical one when no dev
  * copy exists yet.
@@ -116,10 +134,11 @@ function newestBundle() {
 }
 
 /**
- * Rewrite the plugin row's `name:` line, keeping it relative to the patch file.
+ * Rewrite the dev override row's `name:` line, keeping it relative to the patch
+ * file.
  * @param body - the patch file's text.
  * @param specifier - the relative path to write.
- * @returns the new text, or `null` when the row is not in the expected shape.
+ * @returns the new text, or `null` when the override row is not in the expected shape.
  */
 function rewrite(body, specifier) {
   const lines = body.split('\n')
@@ -132,28 +151,42 @@ function rewrite(body, specifier) {
   return lines.join('\n')
 }
 
+/**
+ * Append the dev override row to a profile patch that has none yet.
+ *
+ * This is the shape a fresh `dsh plugin add` leaves behind: the bundle is
+ * selected and supplies its own row, and the profile patch only carries
+ * unrelated overrides.
+ * @param body - the patch file's text.
+ * @param specifier - the relative path to write.
+ * @returns the new text.
+ */
+function appendOverride(body, specifier) {
+  const separator = body.endsWith('\n') ? '' : '\n'
+  return `${body}${separator}\n${MARKER}\n- id: ${ROW_ID}\n  name: ${specifier}\n`
+}
+
 const bundle = newestBundle()
-const files = patchFiles(dshHome())
-if (files.length === 0) {
-  console.error(`[${PACKAGE_NAME}] no profile patch mounts ${ROW_ID}; pass DSH_PROFILE=<name> or install it with \`dsh plugin add\``)
+const profile = findProfile(dshHome())
+if (profile === null) {
+  console.error(`[${PACKAGE_NAME}] no profile selects this bundle; install it with \`dsh plugin --profile <name> add ${PACKAGE_ROOT}\``)
   process.exitCode = 1
 } else {
-  for (const file of files) {
-    // `relative` already yields forward slashes on POSIX; normalise for Windows,
-    // where DSH resolves the name as a path either way.
-    const specifier = relative(dirname(file), bundle).split(sep).join('/')
-    const body = readFileSync(file, 'utf8')
-    const next = rewrite(body, specifier)
-    if (next === null) {
-      console.error(`[${PACKAGE_NAME}] ${file} has no \`- id: ${ROW_ID}\` row followed by a name; leaving it alone`)
-      process.exitCode = 1
-      continue
-    }
-    writePatch(file, next, specifier)
+  // `relative` already yields forward slashes on POSIX; normalise for Windows,
+  // where DSH resolves the name as a path either way.
+  const specifier = relative(dirname(profile.patch), bundle).split(sep).join('/')
+  const body = existsSync(profile.patch) ? readFileSync(profile.patch, 'utf8') : ''
+  const marked = body.includes(MARKER)
+  const next = marked ? rewrite(body, specifier) : appendOverride(body, specifier)
+  if (next === null) {
+    console.error(`[${PACKAGE_NAME}] ${profile.patch} has the dev override marker but no \`- id: ${ROW_ID}\` row followed by a name; leaving it alone`)
+    process.exitCode = 1
+  } else {
+    writePatch(profile.patch, next, specifier)
     // The watcher re-applies on an mtime change; a rebuild that produced the same
     // digest would otherwise leave the running process on the module it has.
     const now = new Date()
-    utimesSync(file, now, now)
-    console.log(`[${PACKAGE_NAME}] ${file} -> ${specifier}`)
+    utimesSync(profile.patch, now, now)
+    console.log(`[${PACKAGE_NAME}] ${profile.patch} -> ${specifier}`)
   }
 }

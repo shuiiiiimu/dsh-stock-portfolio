@@ -9,7 +9,7 @@
 三个入口，读写同一份数据：
 
 - **侧边栏「股票持仓」**（「设置」上方，右侧直接带当日盈亏）→ 管理面板。
-- **对话里读数据、记交易、复盘**：说「昨天买了 100 股腾讯」就写入，缺的字段当场弹一张问题卡片问；问「腾讯最近怎么样」「我在哪个动机上赚得多」时直接读本地 SQLite 回答；问「我的股票表现怎么样」会触发一次复盘（也可以直接敲 `/portfolio-review`）。读持仓、行情与聚合分析不用授权，读**交易记录明细**每次都会先弹一张授权卡片。`
+- **对话里读数据、记交易、复盘**：说「昨天买了 100 股腾讯」就写入，缺的字段当场弹一张问题卡片问；问「腾讯最近怎么样」「我在哪个动机上赚得多」时直接读本地 SQLite 回答；问「我的股票表现怎么样」会触发一次复盘（也可以直接敲 `/portfolio-review`）。读持仓、行情与聚合分析不用授权，读**交易记录明细**每次都会先弹一张授权卡片。
 - **对话右侧栏「持仓提及」**：对话里出现持仓标的的代码或名称时自动展开，列出它的走势与持仓统计。
 
 界面只用 DSH 自己的主题变量（`--dsw-alias-*`），自动跟随浅色 / 深色主题。
@@ -54,7 +54,9 @@
 
 ### 复盘
 
-问「我的股票表现怎么样」就会做一次持仓复盘：一次给全当下的数——盈亏、波动、集中度、浮盈浮亏家数、行情陈旧度。
+问「我的股票表现怎么样」就会做一次持仓复盘：一次给全当下的数——盈亏、波动、集中度、浮盈浮亏家数、行情陈旧度，同时给出一份未来约一个月的研究清单。
+
+复盘分两半：**数字**由插件从本地日线与交易记录算出，不请求行情接口；**未来一个月的走势与催化**（行业竞争、券商预期 / 研报、业务进展、管理层变动、新闻）插件不抓，由对话里的模型用自己的搜索 / 抓取工具按清单逐只查，并标出信息日期与来源。
 
 也可以走斜杠菜单的「复盘持仓」（`/portfolio-review`，想只看一只就直接打 `/portfolio-review 腾讯控股`）。
 
@@ -68,29 +70,14 @@
 
 ## 安装
 
-插件是标准的 DSH **bundle** + **dual-face client**：
+插件是标准的 DSH **bundle** + **dual-face client**，按普通插件安装（插件管理器或 CLI 是同一套）：
 
 ```sh
 npm install && npm run build
-dsh plugin --profile web add ~/codespaces/dsh-stock-portfolio      # 方式一
+dsh plugin --profile web add <checkout 的绝对路径>
 ```
 
-```yaml
-# 方式二：profile 的 patch 层直接挂载本地 checkout（name 相对 patch 文件解析）
-# ~/.dsh/profiles/web/cordis.patch.yml
-- insert:
-    - id: stock-portfolio
-      name: ../../../codespaces/dsh-stock-portfolio/lib/index.js
-```
-
-web profile 是 `patchReload: live`，保存后 Host 半边会重组；浏览器需要刷新一次页面。改完代码不用重启 `dsh`：
-
-```sh
-npm run build     # 额外写一份内容寻址的 lib/index.dev.<digest>.js
-npm run reload    # 把 profile 的行指向最新 dev 副本 → 触发重载
-```
-
-可选配置写在 patch 行里：`dataDir`（默认 `$DSH_HOME/storages/stock-portfolio`）、`apiBase`、`apiKey`。
+也可以在 Web 侧边栏的 **插件** 页安装（插件页显示的就是本包的 `logo.svg` 与 `description`）。安装会写 profile 的 `dsh.profile.bundles` 并把 checkout 链接进 profile 的 `node_modules`，插件行由本包自带的 `cordis.patch.yml` 提供：Host 半边是 `lib/index.js`，浏览器半边由包清单里的 `dsh.client` 声明发现。
 
 ## 开发
 
@@ -99,12 +86,8 @@ npm run build      # lib/index.js（Host）+ lib/client.js（浏览器）+ 类�
 npm run watch      # 监听 src/ 重建
 npm run typecheck  # tsc --noEmit
 npm test           # node --test，全部离线
-npm run reload     # 让运行中的 dsh 换用刚构建的 Host 半边
+npm run reload     # 让运行中的 dsh 换用刚构建的 Host 半边（见下）
 ```
-
-浏览器半边有三类用例：`client-bundle.test.mjs` 用桩模块表加载 `lib/client.js` 并真正执行 `apply`；`client-render.test.mjs` 用真实 React 渲染各分区；`client-mount.test.mjs` 在 jsdom 里挂载真实组件、让 effect 与请求跑完，断言点开一行之后线柱图与指标确实画了出来。
-
-`npm run reload` 按「写同目录临时文件 → rename 覆盖 → 回读校验」替换 patch，并先确认目标 bundle 存在且非空。
 
 ## 已知边界
 
@@ -117,6 +100,6 @@ npm run reload     # 让运行中的 dsh 换用刚构建的 Host 半边
 ## 开源协议与声明
 
 - **License: MIT** — 见 [`LICENSE`](LICENSE)。
-- **DSH 版本**：在 DSH `0.1.5-rc.2`（本地构建）上开发与验证。
+- **DSH 版本**：在 DSH `0.1.7-rc.1`（本地构建）上验证。
 - **行情数据来自 [TickFlow](https://tickflow.org)。** 本项目是第三方客户端与 TickFlow 无隶属或合作关系，相关名称与商标归其各自所有者；个人用户注册可获取免费 API Key，行情数据仅供个人参考，**不构成任何投资建议**，据此操作风险自负。
 

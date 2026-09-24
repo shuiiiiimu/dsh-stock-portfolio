@@ -10,7 +10,7 @@
  */
 import { useEffect, useState } from 'react'
 import {
-  IconCheckOutline16, IconLinkOutline16, IconRefreshOutline16,
+  IconCheckOutlineRegular, IconLinkOutlineRegular, IconRefreshOutlineRegular,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { Banner, KeyValue, SectionTitle } from '../shared.tsx'
 import { relative, timestamp } from '../format.ts'
@@ -131,7 +131,7 @@ export function Settings({ settings, feed, busy, onSave, onRefresh, onRefreshRat
               disabled={saving || apiKey.trim() === ''}
               onClick={() => { void saveKey(apiKey.trim()) }}
             >
-              <IconCheckOutline16 size={13} />
+              <IconCheckOutlineRegular size={13} />
               保存
             </button>
             {settings.apiKeyConfigured && (
@@ -179,7 +179,7 @@ export function Settings({ settings, feed, busy, onSave, onRefresh, onRefreshRat
               disabled={saving}
               onClick={() => { onRefresh(true) }}
             >
-              <IconRefreshOutline16 size={13} className={busy === 'refresh' ? 'dsp-spin' : undefined} />
+              <IconRefreshOutlineRegular size={13} className={busy === 'refresh' ? 'dsp-spin' : undefined} />
               立即刷新
             </button>
           </div>
@@ -302,7 +302,7 @@ export function Settings({ settings, feed, busy, onSave, onRefresh, onRefreshRat
               disabled={saving}
               onClick={() => { onRefreshRates(true) }}
             >
-              <IconRefreshOutline16 size={13} className={busy === 'refresh-rates' ? 'dsp-spin' : undefined} />
+              <IconRefreshOutlineRegular size={13} className={busy === 'refresh-rates' ? 'dsp-spin' : undefined} />
               获取最新
             </button>
           </div>
@@ -334,7 +334,7 @@ export function Settings({ settings, feed, busy, onSave, onRefresh, onRefreshRat
               disabled={saving}
               onClick={() => { void onSyncInstruments() }}
             >
-              <IconRefreshOutline16 size={13} className={busy === 'sync-instruments' ? 'dsp-spin' : undefined} />
+              <IconRefreshOutlineRegular size={13} className={busy === 'sync-instruments' ? 'dsp-spin' : undefined} />
               立即重建索引
             </button>
             <span className="dsp-field-hint">
@@ -363,7 +363,7 @@ export function Settings({ settings, feed, busy, onSave, onRefresh, onRefreshRat
           { label: '行情来源', value: 'TickFlow（api.tickflow.org / free-api.tickflow.org）' },
         ]} />
         <p className="dsp-field-hint" style={{ marginTop: 10 }}>
-          <IconLinkOutline16 size={12} />
+          <IconLinkOutlineRegular size={12} />
           {' '}
           行情数据由 TickFlow 提供，仅供个人参考，不构成投资建议。
         </p>

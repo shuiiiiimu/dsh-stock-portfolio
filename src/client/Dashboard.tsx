@@ -10,7 +10,7 @@
 import { useEffect, useRef } from 'react'
 import type React from 'react'
 import {
-  IconCloseOutline16, IconRefreshOutline16, IconSettingsOutline16,
+  IconCloseOutlineRegular, IconRefreshOutlineRegular, IconSettingsOutlineMedium,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { IconAnalysisOutline16, IconHoldingsOutline16, IconLedgerOutline16, IconOverviewOutline16 } from './icons.tsx'
 import { Overview } from './tabs/Overview.tsx'
@@ -37,7 +37,7 @@ const TABS: readonly TabDef[] = [
   { id: 'holdings', label: '持仓', Icon: IconHoldingsOutline16 },
   { id: 'trades', label: '交易', Icon: IconLedgerOutline16 },
   { id: 'analysis', label: '分析', Icon: IconAnalysisOutline16 },
-  { id: 'settings', label: '设置', Icon: IconSettingsOutline16 },
+  { id: 'settings', label: '设置', Icon: IconSettingsOutlineMedium },
 ]
 
 /**
@@ -199,7 +199,7 @@ export function Dashboard({ store, usePortfolio }: {
               disabled={busy !== null}
               onClick={() => { void store.refresh(true) }}
             >
-              <IconRefreshOutline16 size={13} className={busy === 'refresh' ? 'dsp-spin' : undefined} />
+              <IconRefreshOutlineRegular size={13} className={busy === 'refresh' ? 'dsp-spin' : undefined} />
               {busy === 'refresh' ? '刷新中' : '刷新行情'}
             </button>
             <button
@@ -209,7 +209,7 @@ export function Dashboard({ store, usePortfolio }: {
               aria-label="关闭"
               onClick={() => { store.close() }}
             >
-              <IconCloseOutline16 size={15} />
+              <IconCloseOutlineRegular size={15} />
             </button>
           </header>
 

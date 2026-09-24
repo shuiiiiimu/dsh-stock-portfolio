@@ -4,7 +4,7 @@
  * They exist so the four tabs read as one surface: same card, same banner, same
  * empty state, same bar list.
  */
-import { IconWarningOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconWarningOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import { money, percent, tone } from './format.ts'
 import type { BreakdownRow, Currency } from '../types.ts'
 
@@ -66,7 +66,7 @@ export function Banner({ tone: toneName = 'info', children }: {
 }) {
   return (
     <div className="dsp-banner" data-tone={toneName}>
-      {toneName !== 'info' && <IconWarningOutline16 size={14} />}
+      {toneName !== 'info' && <IconWarningOutlineRegular size={14} />}
       <div>{children}</div>
     </div>
   )

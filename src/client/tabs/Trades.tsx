@@ -17,7 +17,7 @@
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  IconCheckOutline16, IconCloseOutline16, IconEditOutline16, IconPlusOutline16, IconTrashOutline16,
+  IconCheckOutlineRegular, IconCloseOutlineRegular, IconEditOutlineRegular, IconPlusOutlineRegular, IconTrashOutlineRegular,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { Empty, SectionTitle } from '../shared.tsx'
 import { api } from '../api.ts'
@@ -215,7 +215,7 @@ export function Trades({ state, busy, onAdd, onUpdate, onDelete }: {
             setOpen(current => !current)
           }}
         >
-          {open ? <IconCloseOutline16 size={13} /> : <IconPlusOutline16 size={13} />}
+          {open ? <IconCloseOutlineRegular size={13} /> : <IconPlusOutlineRegular size={13} />}
           {open ? '收起' : '添加交易'}
         </button>
       </SectionTitle>
@@ -361,7 +361,7 @@ export function Trades({ state, busy, onAdd, onUpdate, onDelete }: {
 
           <div className="dsp-form-actions">
             <button type="submit" className="dsp-btn" data-variant="primary" disabled={invalid || busy !== null}>
-              <IconCheckOutline16 size={13} />
+              <IconCheckOutlineRegular size={13} />
               {editing === null ? '保存交易' : `保存修改 #${String(editing)}`}
             </button>
             <button type="button" className="dsp-btn" data-variant="ghost" onClick={cancelEdit}>
@@ -456,7 +456,7 @@ export function Trades({ state, busy, onAdd, onUpdate, onDelete }: {
                                     aria-label="取消"
                                     onClick={() => { setConfirming(null) }}
                                   >
-                                    <IconCloseOutline16 size={12} />
+                                    <IconCloseOutlineRegular size={12} />
                                   </button>
                                 </span>
                               )
@@ -470,7 +470,7 @@ export function Trades({ state, busy, onAdd, onUpdate, onDelete }: {
                                     title="编辑"
                                     onClick={() => { startEdit(trade) }}
                                   >
-                                    <IconEditOutline16 size={13} />
+                                    <IconEditOutlineRegular size={13} />
                                   </button>
                                   <button
                                     type="button"
@@ -480,7 +480,7 @@ export function Trades({ state, busy, onAdd, onUpdate, onDelete }: {
                                     title="删除"
                                     onClick={() => { setConfirming(trade.id) }}
                                   >
-                                    <IconTrashOutline16 size={13} />
+                                    <IconTrashOutlineRegular size={13} />
                                   </button>
                                 </span>
                               )}

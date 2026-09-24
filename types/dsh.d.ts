@@ -89,25 +89,51 @@ declare module '@deepseek-ai/dsh-client-ui-primitives' {
     size?: number | undefined
     className?: string | undefined
   }
-  /** A thin-stroke 16px icon. */
+  /**
+   * One product glyph at a named weight.
+   *
+   * The export names are SIZE-NEUTRAL since DSH 0.1.7: the former numeric
+   * suffix (`IconCloseOutline16`, `IconChevronDownOutline14`) is gone, the
+   * `size` prop carries the rendered dimension, and every glyph ships a
+   * `Regular` (1px artwork) and a `Medium` (1.3px inherited stroke) name.
+   * `Medium` is reserved for deliberate emphasis — Settings trigger and
+   * navigation icons, Appearance choices, the composer add button and
+   * clickable artifact links; everything else uses `Regular`.
+   */
   type Icon = (props: IconProps) => import('react').ReactElement
-  export const IconRefreshOutline16: Icon
-  export const IconSettingsOutline16: Icon
-  export const IconCloseOutline16: Icon
-  export const IconPlusOutline16: Icon
-  export const IconTrashOutline16: Icon
-  export const IconCheckOutline16: Icon
-  export const IconWarningOutline16: Icon
-  export const IconChevronDownOutline14: Icon
-  export const IconChevronUpOutline14: Icon
-  export const IconLinkOutline16: Icon
-  export const IconLoadingOutline16: Icon
-  export const IconEllipsisOutline16: Icon
-  export const IconEditOutline16: Icon
-  export const IconSearchOutline16: Icon
-  export const IconDownloadOutline16: Icon
+  export const IconRefreshOutlineRegular: Icon
+  export const IconRefreshOutlineMedium: Icon
+  export const IconSettingsOutlineRegular: Icon
+  export const IconSettingsOutlineMedium: Icon
+  export const IconCloseOutlineRegular: Icon
+  export const IconCloseOutlineMedium: Icon
+  export const IconPlusOutlineRegular: Icon
+  export const IconPlusOutlineMedium: Icon
+  export const IconTrashOutlineRegular: Icon
+  export const IconTrashOutlineMedium: Icon
+  export const IconCheckOutlineRegular: Icon
+  export const IconCheckOutlineMedium: Icon
+  export const IconWarningOutlineRegular: Icon
+  export const IconWarningOutlineMedium: Icon
+  export const IconChevronDownOutlineRegular: Icon
+  export const IconChevronDownOutlineMedium: Icon
+  export const IconChevronUpOutlineRegular: Icon
+  export const IconChevronUpOutlineMedium: Icon
+  export const IconLinkOutlineRegular: Icon
+  export const IconLinkOutlineMedium: Icon
+  export const IconLoadingOutlineRegular: Icon
+  export const IconLoadingOutlineMedium: Icon
+  export const IconEllipsisOutlineRegular: Icon
+  export const IconEllipsisOutlineMedium: Icon
+  export const IconEditOutlineRegular: Icon
+  export const IconEditOutlineMedium: Icon
+  export const IconSearchOutlineRegular: Icon
+  export const IconSearchOutlineMedium: Icon
+  export const IconDownloadOutlineRegular: Icon
+  export const IconDownloadOutlineMedium: Icon
   /** A gauge: used for the portfolio-review command row. */
-  export const IconGaugeOutline16: Icon
+  export const IconGaugeOutlineRegular: Icon
+  export const IconGaugeOutlineMedium: Icon
   /** Hover tooltip wrapper. */
   export const Tooltip: (props: {
     label: string

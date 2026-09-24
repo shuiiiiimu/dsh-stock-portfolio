@@ -4,9 +4,9 @@
  * colour riding `currentColor`), so the sidebar entry sits beside the harness's
  * own glyphs without looking imported.
  *
- * Only the four glyphs the DSH icon set does not already have live here;
- * everything generic (settings, close, plus, trash, refresh, chevrons) comes
- * from `@deepseek-ai/dsh-client-ui-primitives`.
+ * Only the glyphs the DSH icon set does not already have live here; everything
+ * generic (settings, close, plus, trash, refresh, chevrons) comes from
+ * `@deepseek-ai/dsh-client-ui-primitives`.
  */
 
 /** Shared props, matching the primitives' `IconProps`. */
@@ -15,14 +15,38 @@ interface IconProps {
   className?: string | undefined
 }
 
-/** A candlestick pair over a rising baseline: the plugin's own mark. */
+/**
+ * The plugin's mark — three overlapping holdings and a trend line rising across
+ * them — reduced to the 16px grid.
+ *
+ * The full-colour artwork is `logo.svg` at the package root, declared through
+ * the manifest's `icon` and drawn by the Plugin manager. That file is a fixed
+ * blue, so it cannot ride the sidebar's theme the way its neighbouring glyphs
+ * do; this is the same mark redrawn for a seat that must. The two carry the same
+ * arrangement of circles, the same rising line and the same four points, so the
+ * mark reads as one logo in both places.
+ *
+ * Two proportions are deliberately not the artwork's. The coins are smaller and
+ * the trend line thicker: at 16px the artwork's ratio lets the three outlines
+ * crowd into one grey mass and leaves the line as a hairline, and the sidebar
+ * draws this at 16–18px, never larger.
+ */
 export function IconPortfolioOutline16({ size = 16, className }: IconProps) {
   return (
     <svg width={size} height={size} className={className} viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <path d="M3.9 2.6v2.1M3.9 11.4v2" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
-      <rect x="2.4" y="4.7" width="3" height="6.7" rx="1" stroke="currentColor" strokeWidth="1.25" />
-      <path d="M12.1 1.9v2.3M12.1 12.4v1.7" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" />
-      <rect x="10.6" y="4.2" width="3" height="8.2" rx="1" stroke="currentColor" strokeWidth="1.25" />
+      <g stroke="currentColor" strokeWidth="1.05" opacity="0.5">
+        <circle cx="5.9" cy="5.7" r="3.2" />
+        <circle cx="10.1" cy="5.7" r="3.2" />
+        <circle cx="8" cy="9.7" r="3.2" />
+      </g>
+      <path d="M3 10.8l2.6-2.7 2.2 1.6 3.4-4.6" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M8.6 4.3l2.6-.4-.5 2.6" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+      <g fill="currentColor">
+        <circle cx="3" cy="10.8" r="0.8" />
+        <circle cx="5.6" cy="8.1" r="0.8" />
+        <circle cx="7.8" cy="9.7" r="0.8" />
+        <circle cx="11.2" cy="5.1" r="0.8" />
+      </g>
     </svg>
   )
 }

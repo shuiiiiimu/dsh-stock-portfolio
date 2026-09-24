@@ -1,7 +1,7 @@
 {
   "name": "dsh-stock-portfolio",
   "version": "0.1.0",
-  "description": "在 DeepSeek Harness 中管理股票持仓：交易记录（含交易动机）、盈亏计算与统计、日线行情、离线代码检索与持仓分析。",
+  "description": "管理股票持仓：交易记录、盈亏计算与统计、日线行情、离线代码检索与持仓分析。",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -14,6 +14,7 @@
   ],
   "license": "MIT",
   "type": "module",
+  "icon": "./logo.svg",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
   "exports": {
@@ -30,7 +31,8 @@
   "files": [
     "lib",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "logo.svg"
   ],
   "dsh": {
     "bundle": {

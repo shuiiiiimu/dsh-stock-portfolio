@@ -17,7 +17,7 @@
  * only pushed the table down.
  */
 import { Fragment, useState } from 'react'
-import { IconChevronDownOutline14 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconChevronDownOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import { SymbolDetail } from '../SymbolDetail.tsx'
 import { Empty } from '../shared.tsx'
 import { useSymbolBars } from '../useBars.ts'
@@ -160,7 +160,7 @@ export function Holdings({ state }: { state: PortfolioState }) {
                           aria-label={`${open ? '收起' : '展开'} ${row.symbol} 的走势与指标`}
                           onClick={(event) => { event.stopPropagation(); toggleRow(row.symbol) }}
                         >
-                          <IconChevronDownOutline14 size={12} />
+                          <IconChevronDownOutlineRegular size={12} />
                         </button>
                         <div className="dsp-symbol">
                           <span className="dsp-symbol-code">{row.symbol}</span>
