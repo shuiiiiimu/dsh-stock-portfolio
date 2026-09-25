@@ -89,6 +89,16 @@ npm test           # node --test，全部离线
 npm run reload     # 让运行中的 dsh 换用刚构建的 Host 半边（见下）
 ```
 
+### 开发时的热重载
+
+`npm run reload` 让**已经在运行**的 dsh 换用刚构建的 Host 半边，不用重启。它维护 profile `cordis.patch.yml` 里一块带哨兵的「dev 覆盖」：**停用** bundle 自带的 `stock-portfolio` 行，再**另插**一行指向内容寻址的 `lib/index.dev.<digest>.js`。三个理由各占一环：
+
+- **不能改成给 bundle 行改名**：Loader 会跳过 `name` 与目标行不一致的**非 insert** 补丁（`patch: name mismatch ... skipping`），所以在 `- id: stock-portfolio` 上加 `name:` 是静默无效的——行照旧加载 `lib/index.js`，只有重启才换模块。
+- **停用不等于卸载**：bundle 仍留在 `dsh.profile.bundles`，浏览器半边照旧被发现；但那一行不能再挂载已发布的 bundle，否则插件会挂两遍（两个 store、两次路由注册）。
+- **digest 才是热重载的关键**：Node 按解析后的 URL 缓存 ES 模块，只有 Loader 从没导入过的名字才会读到新构建。
+
+`npm run build` 产出新 digest，`npm run reload` 把覆盖行指过去，profile 的 `patchReload: live` 让它立即生效。删掉那块覆盖（或重跑插件安装）就回到 bundle 自带的 `lib/index.js`。
+
 ## 已知边界
 
 - 会话里能读持仓、行情、聚合分析与交易记录，但只能**新增**交易：改一笔、删一笔仍在面板里做。读交易明细每次都要用户点一次同意，没有明确同意就一条记录也不返回。
@@ -100,6 +110,6 @@ npm run reload     # 让运行中的 dsh 换用刚构建的 Host 半边（见下
 ## 开源协议与声明
 
 - **License: MIT** — 见 [`LICENSE`](LICENSE)。
-- **DSH 版本**：在 DSH `0.1.7-rc.1`（本地构建）上验证。
+- **DSH 版本**：在 DSH `0.1.7-rc.2`（本地构建）上验证。
 - **行情数据来自 [TickFlow](https://tickflow.org)。** 本项目是第三方客户端与 TickFlow 无隶属或合作关系，相关名称与商标归其各自所有者；个人用户注册可获取免费 API Key，行情数据仅供个人参考，**不构成任何投资建议**，据此操作风险自负。
 

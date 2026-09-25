@@ -4,24 +4,38 @@
  * The plugin is installed as a normal profile bundle (`dsh plugin --profile web
  * add <checkout>`) — the plugin manager writes it into `dsh.profile.bundles` and
  * links the checkout into the profile's node_modules, so the package's own
- * `cordis.patch.yml` supplies the `stock-portfolio` row and the row loads
- * `lib/index.js` by default. This script adds the DEV OVERRIDE on top of that
- * row: a profile patch row with the same id whose `name` names the
- * content-addressed `lib/index.dev.<digest>.js`.
+ * `cordis.patch.yml` supplies the `stock-portfolio` row, and that row loads
+ * `lib/index.js` by default.
  *
- * The digest is why the override exists. Node caches an ES module by resolved
- * URL, so re-applying a patch that names the same file hands the Loader the
- * module it already has; a rebuild writes a NEW digest, which is a URL the Loader
- * has never imported. That is what makes a Host-side change live without
- * restarting `dsh`, on top of the manager-installed bundle rather than instead
- * of it. Without the override the mounted row keeps the package entry
- * `lib/index.js`, and a Host-side change then needs a `dsh` restart.
+ * Making a Host-side change live needs the mounted row to name a URL the Loader
+ * has never imported: Node caches an ES module by resolved URL, so re-applying a
+ * patch that names the same file hands the Loader the module it already has.
+ * `npm run build` writes a content-addressed copy (`lib/index.dev.<digest>.js`)
+ * for exactly that, and this script points the running profile at the newest one.
+ *
+ * It cannot do that by RENAMING the bundle row. The Loader's patch layer skips a
+ * non-insert patch whose `name` differs from the target row's
+ * (`vendor/include/src/index.ts` -> `patch: name mismatch ... skipping`), so a
+ * profile row reading `- id: stock-portfolio` + `name: <digest path>` is a silent
+ * no-op: the row keeps loading `lib/index.js`, and only a `dsh` restart picks up
+ * a rebuild. What the Loader does honour is an INSERT, so this script instead:
+ *
+ *   1. DISABLES the bundle's own row, and
+ *   2. INSERTS a second row, under its own id, naming the digest file.
+ *
+ * Disabling is not an uninstall and not a second mount. The bundle stays selected
+ * in `dsh.profile.bundles`, so nothing is removed and the browser half is still
+ * discovered (client packages are found per ACTIVE Loader row, and the inserted
+ * row names a module inside the same package, so it resolves to the same
+ * manifest). The disabled row no longer mounts the published bundle, which is
+ * what would otherwise bring the plugin up twice: two stores, two route
+ * registrations.
  *
  * Every path is resolved at run time — `$DSH_HOME` (or `~/.dsh`), the profile
- * directory holding the override row, and the relative hop from that profile
+ * directory holding the override block, and the relative hop from that profile
  * back to `lib/` — so neither this script nor the patch file has to carry a
- * hard-coded home directory. The row keeps a RELATIVE name, which DSH itself
- * anchors to the patch file's directory.
+ * hard-coded home directory. The inserted row keeps a RELATIVE name, which DSH
+ * anchors to the directory of the patch file that wrote it.
  *
  * Usage: `npm run reload` (after `npm run build`), optionally with
  * `DSH_PROFILE=<name>` when more than one profile has the plugin installed.
@@ -35,13 +49,18 @@
 import { existsSync, readFileSync, readdirSync, renameSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, relative, resolve, sep } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const PACKAGE_NAME = 'dsh-stock-portfolio'
+/** Id of the row this package's own `cordis.patch.yml` inserts. */
 const ROW_ID = 'stock-portfolio'
-/** Comment line marking this checkout's dev override, wherever this script wrote it. */
+/** Id of the row this script inserts to mount the content-addressed dev copy. */
+const DEV_ROW_ID = 'stock-portfolio-dev'
+/** Opening sentinel of the block this script owns, wherever it wrote it. */
 const MARKER = `# --- ${PACKAGE_NAME} dev override ---`
+/** Closing sentinel: a rewrite replaces exactly the lines between the two. */
+const END_MARKER = `# --- end ${PACKAGE_NAME} dev override ---`
 
 /**
  * Replace one file's contents without ever exposing a partial file.
@@ -60,21 +79,126 @@ function replaceAtomically(path, body) {
 }
 
 /**
+ * The managed block, without a trailing newline.
+ *
+ * The prose rides inside the block so a fresh install explains itself where the
+ * mechanism lives, and the two sentinels are what keep a rewrite from touching a
+ * neighbouring plugin's rows.
+ * @param specifier - the relative module specifier of the dev bundle.
+ * @returns the block's text.
+ */
+function overrideBlock(specifier) {
+  return [
+    MARKER,
+    '#',
+    '# Managed by `npm run reload` in the dsh-stock-portfolio checkout. Do not',
+    '# edit by hand: the next reload replaces everything between the sentinels.',
+    '#',
+    '# Why the row below is DISABLED and the dev copy is INSERTED, rather than the',
+    '# bundle row simply being renamed to name the dev copy: the Loader skips a',
+    '# non-insert patch whose `name` differs from the target row name, so a `name:`',
+    '# on the bundle row would be ignored and only a dsh restart would pick up a',
+    '# rebuild. An insert is not name-checked.',
+    '#',
+    '# Disabling the bundle row is not an uninstall: the package stays in',
+    '# `dsh.profile.bundles` and the browser half is still discovered, but the row',
+    '# stops mounting the published bundle. Without that, the plugin would come up',
+    '# twice: two stores, two route registrations.',
+    '#',
+    '# The digest is what makes the swap live: Node caches an ES module by resolved',
+    '# URL, so only a name the Loader has never imported re-reads the new build.',
+    `- id: ${ROW_ID}`,
+    '  disabled: true',
+    '- insert:',
+    `    - id: ${DEV_ROW_ID}`,
+    `      name: ${specifier}`,
+    END_MARKER,
+  ].join('\n')
+}
+
+/**
+ * The top-level rows the managed block owns, as whole lines.
+ * @param line - one line of the patch file.
+ * @returns whether the line belongs to the block.
+ */
+function isOwnedRow(line) {
+  return line === `- id: ${ROW_ID}` || line === '- insert:'
+}
+
+/**
+ * Ensure a file's text ends with exactly one newline.
+ * @param text - the file's text.
+ * @returns the terminated text.
+ */
+function terminated(text) {
+  return text.endsWith('\n') ? text : `${text}\n`
+}
+
+/**
+ * Replace the dev override block's `name:` line, keeping it relative to the
+ * patch file.
+ *
+ * A block written before the closing sentinel existed (or hand-edited) is
+ * migrated in place: it owns its rows and their continuations up to the next
+ * top-level patch entry that is not one of its own.
+ * @param body - the patch file's text.
+ * @param specifier - the relative path to write.
+ * @returns the new text, or `null` when this file carries no managed block.
+ */
+function rewrite(body, specifier) {
+  const lines = body.split('\n')
+  const begin = lines.indexOf(MARKER)
+  if (begin === -1) return null
+  let end = lines.indexOf(END_MARKER, begin + 1)
+  if (end === -1) {
+    end = begin + 1
+    while (end < lines.length) {
+      if (isOwnedRow(lines[end]) || /^\s/u.test(lines[end]) || lines[end].trim() === '') end += 1
+      else break
+    }
+  } else {
+    // Include the closing sentinel itself in the replaced range.
+    end += 1
+  }
+  const before = lines.slice(0, begin).join('\n')
+  const after = lines.slice(end).join('\n')
+  return terminated([before, overrideBlock(specifier), after].filter(part => part !== '').join('\n'))
+}
+
+/**
+ * Append the dev override block to a profile patch that has none yet.
+ *
+ * This is the shape a fresh `dsh plugin add` leaves behind: the bundle is
+ * selected and supplies its own row, and the profile patch only carries
+ * unrelated overrides.
+ * @param body - the patch file's text.
+ * @param specifier - the relative path to write.
+ * @returns the new text.
+ */
+function appendBlock(body, specifier) {
+  const base = body === '' ? '' : `${body.endsWith('\n') ? body : `${body}\n`}\n`
+  return terminated(`${base}${overrideBlock(specifier)}`)
+}
+
+/**
  * Replace the patch, then read it back.
  *
  * The read-back is the guard that matters: this one file decides whether the
- * harness starts at all, so the script confirms that what is now on disk still
- * carries the row it just rewrote before it reports success.
+ * harness starts at all, and the two rows below are the difference between one
+ * mounted plugin and two. The script confirms that what is now on disk carries
+ * the bundle row disabled (so it does not mount) AND the inserted dev row.
  * @param path - the patch file.
  * @param body - the new contents.
- * @param specifier - the module specifier that must appear on the row.
- * @throws {Error} when the written file does not carry the row and its name.
+ * @param specifier - the module specifier that must appear on the inserted row.
+ * @throws {Error} when the written file does not carry the complete block.
  */
 function writePatch(path, body, specifier) {
   replaceAtomically(path, body)
   const written = readFileSync(path, 'utf8')
-  if (!written.includes(`- id: ${ROW_ID}`) || !written.includes(`name: ${specifier}`)) {
-    throw new Error(`${path} did not read back with the ${ROW_ID} row; restore it from a backup before starting dsh`)
+  const disabled = written.includes(`- id: ${ROW_ID}\n  disabled: true`)
+  const inserted = written.includes(`- id: ${DEV_ROW_ID}`) && written.includes(`name: ${specifier}`)
+  if (!disabled || !inserted) {
+    throw new Error(`${path} did not read back with a complete dev override block (${ROW_ID} disabled + ${DEV_ROW_ID} insert); restore it from a backup before starting dsh`)
   }
 }
 
@@ -133,60 +257,31 @@ function newestBundle() {
   return bundle
 }
 
-/**
- * Rewrite the dev override row's `name:` line, keeping it relative to the patch
- * file.
- * @param body - the patch file's text.
- * @param specifier - the relative path to write.
- * @returns the new text, or `null` when the override row is not in the expected shape.
- */
-function rewrite(body, specifier) {
-  const lines = body.split('\n')
-  const idAt = lines.findIndex(line => line.trim() === `- id: ${ROW_ID}`)
-  if (idAt === -1) return null
-  const nameAt = lines.findIndex((line, index) => index > idAt && /^\s*name:/u.test(line))
-  if (nameAt === -1) return null
-  const indent = /^\s*/u.exec(lines[nameAt])[0]
-  lines[nameAt] = `${indent}name: ${specifier}`
-  return lines.join('\n')
-}
-
-/**
- * Append the dev override row to a profile patch that has none yet.
- *
- * This is the shape a fresh `dsh plugin add` leaves behind: the bundle is
- * selected and supplies its own row, and the profile patch only carries
- * unrelated overrides.
- * @param body - the patch file's text.
- * @param specifier - the relative path to write.
- * @returns the new text.
- */
-function appendOverride(body, specifier) {
-  const separator = body.endsWith('\n') ? '' : '\n'
-  return `${body}${separator}\n${MARKER}\n- id: ${ROW_ID}\n  name: ${specifier}\n`
-}
-
-const bundle = newestBundle()
-const profile = findProfile(dshHome())
-if (profile === null) {
-  console.error(`[${PACKAGE_NAME}] no profile selects this bundle; install it with \`dsh plugin --profile <name> add ${PACKAGE_ROOT}\``)
-  process.exitCode = 1
-} else {
+/** Point the profile that selects this bundle at the newest Host build. */
+function main() {
+  const bundle = newestBundle()
+  const profile = findProfile(dshHome())
+  if (profile === null) {
+    console.error(`[${PACKAGE_NAME}] no profile selects this bundle; install it with \`dsh plugin --profile <name> add ${PACKAGE_ROOT}\``)
+    process.exitCode = 1
+    return
+  }
   // `relative` already yields forward slashes on POSIX; normalise for Windows,
   // where DSH resolves the name as a path either way.
   const specifier = relative(dirname(profile.patch), bundle).split(sep).join('/')
   const body = existsSync(profile.patch) ? readFileSync(profile.patch, 'utf8') : ''
-  const marked = body.includes(MARKER)
-  const next = marked ? rewrite(body, specifier) : appendOverride(body, specifier)
-  if (next === null) {
-    console.error(`[${PACKAGE_NAME}] ${profile.patch} has the dev override marker but no \`- id: ${ROW_ID}\` row followed by a name; leaving it alone`)
-    process.exitCode = 1
-  } else {
-    writePatch(profile.patch, next, specifier)
-    // The watcher re-applies on an mtime change; a rebuild that produced the same
-    // digest would otherwise leave the running process on the module it has.
-    const now = new Date()
-    utimesSync(profile.patch, now, now)
-    console.log(`[${PACKAGE_NAME}] ${profile.patch} -> ${specifier}`)
-  }
+  const next = rewrite(body, specifier) ?? appendBlock(body, specifier)
+  writePatch(profile.patch, next, specifier)
+  // The watcher re-applies on an mtime change; a rebuild that produced the same
+  // digest would otherwise leave the running process on the module it has.
+  const now = new Date()
+  utimesSync(profile.patch, now, now)
+  console.log(`[${PACKAGE_NAME}] ${profile.patch} -> ${specifier}`)
+}
+
+export { DEV_ROW_ID, END_MARKER, MARKER, ROW_ID, appendBlock, overrideBlock, rewrite, writePatch }
+
+// Importable for tests; only `npm run reload` touches a profile.
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  main()
 }
