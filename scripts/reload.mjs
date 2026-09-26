@@ -57,6 +57,37 @@ const PACKAGE_NAME = 'dsh-stock-portfolio'
 const ROW_ID = 'stock-portfolio'
 /** Id of the row this script inserts to mount the content-addressed dev copy. */
 const DEV_ROW_ID = 'stock-portfolio-dev'
+/**
+ * The inserted row's mount guard, as a Loader `!!js` expression.
+ *
+ * The inserted row lives in the PROFILE patch, and `dsh.profile.bundles` membership
+ * does not govern it: with the bundle switched off in the plugin manager the
+ * bundle's own row is gone while this row would keep mounting the plugin, so the
+ * switch would look broken — the sidebar's 「股票持仓」 row and its day-P&L badge
+ * stay on screen and nothing appears to happen. The guard mounts this row only
+ * while the bundle's own row is present AND suppressed, which is exactly the state
+ * the block below creates. No matching row (bundle off) => guard false => the
+ * plugin comes down whole, Host half and browser half together, because the
+ * browser half is discovered per ACTIVE row. A bundle row that is present but
+ * ENABLED => guard false as well, so the published row mounts alone instead of
+ * twice: the row's own switch in the plugin list rewrites this block's
+ * `disabled: true` line to `false` in place (and a hand edit can do the same),
+ * which is what a plain disable+insert block would otherwise answer with two
+ * live stores and two route registrations.
+ *
+ * It reads the COMPOSED entry list (`entry.parent.tree.root.data`, assigned before
+ * any row of a reconcile is created or removed) and not the live Loader store. The
+ * store is filled row by row — ids that already existed first, ids this reconcile
+ * introduces last — so on the pass that re-adds the bundle, the bundle's row is
+ * created AFTER this one. A store lookup there reads "no bundle row" and disposes
+ * the dev row, which is how a switch flipped off-then-on left the plugin down until
+ * the next unrelated reload.
+ *
+ * The expression is re-evaluated on every mount decision (`Entry.disabled` in
+ * `vendor/loader/src/config/entry.ts`), and a profile reload re-updates every row
+ * of the composed list, so the switch works in both directions without a restart.
+ */
+const DEV_ROW_GUARD = `!ctx[Symbol.for('cordis.entry')].parent.tree.root.data.some(row => row.id === '${ROW_ID}' && row.disabled)`
 /** Opening sentinel of the block this script owns, wherever it wrote it. */
 const MARKER = `# --- ${PACKAGE_NAME} dev override ---`
 /** Closing sentinel: a rewrite replaces exactly the lines between the two. */
@@ -105,6 +136,14 @@ function overrideBlock(specifier) {
     '# stops mounting the published bundle. Without that, the plugin would come up',
     '# twice: two stores, two route registrations.',
     '#',
+    '# The inserted row carries a mount guard: it stays down unless the bundle row',
+    '# is present AND suppressed. That row is the only signal the plugin manager',
+    '# owns, so switching the bundle off takes both halves down (nothing is left to',
+    '# mount the plugin, and the browser half is discovered per active row) and',
+    '# switching it back on restores this row. Without the guard the inserted row',
+    '# would keep the plugin alive after the bundle was switched off — a switch that',
+    '# visibly does nothing: 「股票持仓」 and its day P&L stay in the sidebar.',
+    '#',
     '# The digest is what makes the swap live: Node caches an ES module by resolved',
     '# URL, so only a name the Loader has never imported re-reads the new build.',
     `- id: ${ROW_ID}`,
@@ -112,6 +151,7 @@ function overrideBlock(specifier) {
     '- insert:',
     `    - id: ${DEV_ROW_ID}`,
     `      name: ${specifier}`,
+    `      disabled: !!js "${DEV_ROW_GUARD}"`,
     END_MARKER,
   ].join('\n')
 }
@@ -185,8 +225,10 @@ function appendBlock(body, specifier) {
  *
  * The read-back is the guard that matters: this one file decides whether the
  * harness starts at all, and the two rows below are the difference between one
- * mounted plugin and two. The script confirms that what is now on disk carries
- * the bundle row disabled (so it does not mount) AND the inserted dev row.
+ * mounted plugin and two — or between a plugin the profile switch can turn off and
+ * one it cannot. The script confirms that what is now on disk carries the bundle
+ * row disabled (so it does not mount), the inserted dev row, and that row's mount
+ * guard.
  * @param path - the patch file.
  * @param body - the new contents.
  * @param specifier - the module specifier that must appear on the inserted row.
@@ -197,8 +239,9 @@ function writePatch(path, body, specifier) {
   const written = readFileSync(path, 'utf8')
   const disabled = written.includes(`- id: ${ROW_ID}\n  disabled: true`)
   const inserted = written.includes(`- id: ${DEV_ROW_ID}`) && written.includes(`name: ${specifier}`)
-  if (!disabled || !inserted) {
-    throw new Error(`${path} did not read back with a complete dev override block (${ROW_ID} disabled + ${DEV_ROW_ID} insert); restore it from a backup before starting dsh`)
+  const guarded = written.includes(`disabled: !!js "${DEV_ROW_GUARD}"`)
+  if (!disabled || !inserted || !guarded) {
+    throw new Error(`${path} did not read back with a complete dev override block (${ROW_ID} disabled + ${DEV_ROW_ID} insert + mount guard); restore it from a backup before starting dsh`)
   }
 }
 
@@ -279,7 +322,7 @@ function main() {
   console.log(`[${PACKAGE_NAME}] ${profile.patch} -> ${specifier}`)
 }
 
-export { DEV_ROW_ID, END_MARKER, MARKER, ROW_ID, appendBlock, overrideBlock, rewrite, writePatch }
+export { DEV_ROW_GUARD, DEV_ROW_ID, END_MARKER, MARKER, ROW_ID, appendBlock, overrideBlock, rewrite, writePatch }
 
 // Importable for tests; only `npm run reload` touches a profile.
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

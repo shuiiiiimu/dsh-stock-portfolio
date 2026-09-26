@@ -91,10 +91,11 @@ npm run reload     # 让运行中的 dsh 换用刚构建的 Host 半边（见下
 
 ### 开发时的热重载
 
-`npm run reload` 让**已经在运行**的 dsh 换用刚构建的 Host 半边，不用重启。它维护 profile `cordis.patch.yml` 里一块带哨兵的「dev 覆盖」：**停用** bundle 自带的 `stock-portfolio` 行，再**另插**一行指向内容寻址的 `lib/index.dev.<digest>.js`。三个理由各占一环：
+`npm run reload` 让**已经在运行**的 dsh 换用刚构建的 Host 半边，不用重启。它维护 profile `cordis.patch.yml` 里一块带哨兵的「dev 覆盖」：**停用** bundle 自带的 `stock-portfolio` 行，再**另插**一行指向内容寻址的 `lib/index.dev.<digest>.js`。四个理由各占一环：
 
 - **不能改成给 bundle 行改名**：Loader 会跳过 `name` 与目标行不一致的**非 insert** 补丁（`patch: name mismatch ... skipping`），所以在 `- id: stock-portfolio` 上加 `name:` 是静默无效的——行照旧加载 `lib/index.js`，只有重启才换模块。
 - **停用不等于卸载**：bundle 仍留在 `dsh.profile.bundles`，浏览器半边照旧被发现；但那一行不能再挂载已发布的 bundle，否则插件会挂两遍（两个 store、两次路由注册）。
+- **插入的行必须跟着 bundle 的开关走**：profile patch 插入的行不受 `dsh.profile.bundles` 约束，所以它带一条 `!!js` 挂载守卫，只在 bundle 那一行「存在且被停用」时才挂载。没有守卫时，插件管理器里关掉这个 bundle 只会让 bundle 那一行消失，dev 行仍把插件挂着：侧栏的「股票持仓」和当日盈亏照旧，开关看起来失灵。守卫读的是**本轮组合好的 entry 列表**（`entry.parent.tree.root.data`），而不是 Live store——同一轮里新出现的 id 会被最后创建，读 store 会在「重新开启」的那一轮看不到 bundle 行，把 dev 行卸掉之后不再重挂。
 - **digest 才是热重载的关键**：Node 按解析后的 URL 缓存 ES 模块，只有 Loader 从没导入过的名字才会读到新构建。
 
 `npm run build` 产出新 digest，`npm run reload` 把覆盖行指过去，profile 的 `patchReload: live` 让它立即生效。删掉那块覆盖（或重跑插件安装）就回到 bundle 自带的 `lib/index.js`。
